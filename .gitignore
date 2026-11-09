@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.tmp-*/
+.cert/
+*.log
+.DS_Store
+.workbuddy/

@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <meta name="theme-color" content="#f7f7f5" />
+    <title>网球体感 P0 · 球拍端</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body class="ctrl-page">
+    <div id="gate" class="gate">
+      <div class="gate-inner">
+        <div class="racket-icon">
+          <svg viewBox="0 0 64 64" width="56" height="56" aria-hidden="true">
+            <ellipse cx="32" cy="22" rx="17" ry="20" fill="none" stroke="currentColor" stroke-width="2.5" />
+            <path d="M32 42v18" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" />
+            <path d="M24 20h16M22 28h20" stroke="currentColor" stroke-width="1" opacity="0.45" />
+          </svg>
+        </div>
+        <h1 id="gate-title">横握手机，当作球拍</h1>
+        <p id="gate-hint" class="gate-hint">
+          像握拍柄一样横向握住手机，屏幕朝上。<br />
+          握好之后点下面的按钮，那一刻的姿态会被记为「中位」。<br />
+          <strong>记得先套上腕带。</strong>
+        </p>
+
+        <div id="gate-diag" class="diag" hidden></div>
+
+        <button id="start" class="primary">开始挥拍</button>
+        <p id="gate-msg" class="gate-msg"></p>
+
+        <div id="gate-actions" class="gate-actions" hidden>
+          <input id="gate-url" class="gate-url" readonly />
+          <div class="gate-btns">
+            <button id="copy-link" class="ghost">复制链接</button>
+            <button id="demo-btn" class="ghost">演示数据看效果</button>
+          </div>
+        </div>
+
+        <p id="gate-facts" class="gate-facts"></p>
+      </div>
+    </div>
+
+    <div id="running" class="running" hidden>
+      <div class="live-head">
+        <span id="conn-pill" class="pill">未连接</span>
+        <span id="pose-src" class="rate">—</span>
+        <span id="rate" class="rate">— Hz</span>
+        <span id="pose-rate" class="rate">姿态 —</span>
+      </div>
+
+      <canvas id="axes" width="300" height="300"></canvas>
+
+      <div class="gauges">
+        <div class="gauge">
+          <div class="gauge-label">角速度 |ω|</div>
+          <div class="gauge-bar"><i id="w-bar"></i></div>
+          <div class="gauge-val"><span id="w-val">0</span> °/s</div>
+        </div>
+        <div class="gauge">
+          <div class="gauge-label">加速度 |a|</div>
+          <div class="gauge-bar"><i id="g-bar"></i></div>
+          <div class="gauge-val"><span id="g-val">1.0</span> g</div>
+        </div>
+      </div>
+
+      <div class="flags">
+        <span id="flag-gsat" class="flag">加速度计量程溢出</span>
+        <span id="flag-wsat" class="flag">陀螺仪量程溢出</span>
+        <span id="flag-gyro" class="flag">角速度：姿态差分</span>
+      </div>
+
+      <p class="ctrl-tip">
+        甩几下试试：加速度冲到 16g 以上说明量程被打爆了，<br />这决定我们后面要不要换用峰值检测而不是积分。
+      </p>
+    </div>
+
+    <script type="module" src="/src/controller/main.ts"></script>
+  </body>
+</html>

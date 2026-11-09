@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>网球体感 P1 · 对墙打</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body class="play-page">
+    <canvas id="scene"></canvas>
+
+    <div id="connect-panel" class="panel connect-panel">
+      <h1>用手机当球拍</h1>
+      <p class="hint">手机扫下面的码，或者手动输入地址。两台设备需要在同一个 Wi-Fi 下（建议 5GHz）。</p>
+      <p id="proto-warn" class="proto-warn" hidden></p>
+      <div class="qr-wrap">
+        <canvas id="qr"></canvas>
+      </div>
+      <div class="room-row">
+        <span class="room-label">房间号</span>
+        <code id="room-code">----</code>
+      </div>
+      <div class="url-row">
+        <code id="ctrl-url">—</code>
+        <button id="copy-url" class="ghost">复制</button>
+      </div>
+      <p id="link-state" class="link-state">正在等待手机接入…</p>
+    </div>
+
+    <div id="game-hud" class="game-hud" hidden>
+      <div class="g-streak">
+        <span class="g-label">连拍</span>
+        <span id="s-streak" class="g-num">0</span>
+      </div>
+      <div class="g-sub">
+        <span>最好 <b id="s-best">0</b></span>
+        <span class="g-dot">·</span>
+        <span><b id="s-speed">—</b><em>km/h</em></span>
+        <span class="g-dot">·</span>
+        <span id="s-shot">—</span>
+      </div>
+      <div id="s-hint" class="g-hint"></div>
+    </div>
+
+    <div class="linkpanel">
+      <div class="lp-head">
+        <span>链路</span>
+        <span id="verdict" class="verdict">—</span>
+      </div>
+      <div class="hit-row">
+        <span class="k">挥拍</span><span class="v" id="s-swings">0</span>
+        <span class="k">到面</span><span class="v" id="s-reaches">0</span>
+        <span class="k">时差</span><span class="v" id="s-lag">—</span>
+        <span class="k">甜区</span><span class="v" id="s-aty">—</span>
+        <span class="k">出球</span><span class="v" id="s-latency">—</span>
+        <span class="k">拍面</span><span class="v" id="s-face">—</span>
+      </div>
+      <div class="lp-grid">
+        <div class="stat wide"><span class="k">端到端 p50</span><span class="v accent" id="s-e2e">—</span></div>
+        <div class="stat"><span class="k">网络 p50</span><span class="v" id="s-p50">—</span></div>
+        <div class="stat"><span class="k">p95</span><span class="v" id="s-p95">—</span></div>
+        <div class="stat"><span class="k">抖动</span><span class="v" id="s-jit">—</span></div>
+        <div class="stat"><span class="k">包率</span><span class="v" id="s-hz">—</span></div>
+        <div class="stat"><span class="k">丢包</span><span class="v" id="s-loss">—</span></div>
+        <div class="stat"><span class="k">FPS</span><span class="v" id="s-fps">—</span></div>
+        <div class="stat"><span class="k">峰值角速度</span><span class="v" id="s-w">—</span></div>
+        <div class="stat"><span class="k">峰值加速度</span><span class="v" id="s-g">—</span></div>
+      </div>
+      <canvas id="spark" width="640" height="72"></canvas>
+    </div>
+
+    <div class="hint-bar">
+      <kbd>WASD</kbd> 走位 · <kbd>拖动</kbd> 环视 · <kbd>M</kbd> 模拟控制器 · <kbd>X</kbd> 声音 ·
+      <kbd>C</kbd> 重新开始 · <kbd>R</kbd> 重置统计
+    </div>
+
+    <script type="module" src="/src/play/main.ts"></script>
+  </body>
+</html>
