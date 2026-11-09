@@ -249,3 +249,17 @@ P1 手感闭环：`vec` / `court` / `swing` / `physics` / `rally` / `audio`。�
 **需求**：说清 `tests/` 测的是什么，并留一份可查的说明。
 
 新增 `docs/testing.md`（第 8 节）：运行链路（tsc → `.tmp-test` 编译产物 → `run.cjs`）、验证分层分工、13 个分组逐组覆盖点（77 项）、9 条不能删的反证、加新测试的约定与盲区。`AGENTS.md` 文档地图与 `README.md` 测试章各加一行指针，**未改任何代码与测试**。
+
+## 4.9 2026-11-10 · 验证流水线固化（不改 core 行为）
+
+**需求**：把「改完必跑三件事」从文档约定变成机器可判定的门禁，避免靠记忆执行。
+
+改动：
+
+- 新增 `scripts/verify.mjs`：按 `test` ×3 → `sim` → `build` 顺序调用 `package.json` 里的脚本（命令定义只留一处，不复制），任一步失败立即停止并以非零码退出；末尾按 `git diff` 命中的文件提示该跑哪个 probe。`--fast` 为 `test` ×1 + `build`。
+- 新增 `scripts/hooks/pre-commit` 与 `scripts/install-hooks.mjs`：用 `core.hooksPath` 指向仓库内的 `scripts/hooks/`（`.git/hooks/` 不进版本库），由 `package.json` 的 `prepare` 在 `npm install` 时自动挂载；非 git 工作树静默跳过。
+- `AGENTS.md` 第 3、4 节、`docs/testing.md` 8.1、`README.md` 命令表 / 测试章 / 目录树补指针。
+
+**方案取舍**：没有做成 MCP server 或 skill —— 两者都落在用户级配置，不随仓库分发，且「工具可见」不等于「必然执行」。脚本 + hook 进 git、由退出码判定，换机器 `npm install` 即生效。将来若要把 probe 参数化查询包成 MCP，verify 脚本本身就是可复用的内核。
+
+验证：`npm run verify` 全套通过（77 项 ×3、sim 30/30 零漏接零撞网、build 通过）；`node scripts/verify.mjs --fast` 与手动触发 `pre-commit` 均通过；`core.hooksPath` 实测为 `scripts/hooks`。**未改 core 行为，真机症状（7.1）仍未验证。**

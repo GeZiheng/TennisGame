@@ -58,6 +58,7 @@ npm run dev          # HTTP，5173，不需要证书
 | `npm run build` | 类型检查 + 打包 |
 | `npm test` | 核心逻辑单测（77 项，不需要浏览器） |
 | `npm run sim` | 端到端模拟：假数据跑完整对拉，验证手感参数 |
+| `npm run verify` | 全套验证：单测 ×3 → sim → build，任一步失败即退出（提交前的快检由 git hook 自动跑） |
 | `npm run cert` | 只重新签证书（局域网 IP 变了时用） |
 | `npm run trust` | 把根证书装进系统受信任库 |
 | `npm run test:signal` | 信令房间配对冒烟测试（需先 `npm run dev`） |
@@ -443,6 +444,7 @@ x 这一条是精确的，不是凑数：`sweepFace` 的判据是「球心落在
 ```bash
 npm test       # 77 项 / 13 个分组：核心逻辑单测（分组明细见 docs/testing.md）
 npm run sim    # 端到端模拟，五档力度 × 6 个种子
+npm run verify # 全套验证：test ×3 → sim → build；提交前 hook 自动跑快检
 ```
 
 完整的分组清单、运行链路与「怎么加新测试」见 `docs/testing.md`；下面只列最值得留意的几条断言。
@@ -507,6 +509,9 @@ scripts/
   test.mjs              单测跑手（编译 core 到 .tmp-test 再跑）
   sim.mjs / sim-e2e.cjs 端到端模拟（五档力度 × 6 个种子）
   signal-smoke.mjs      信令冒烟测试
+  verify.mjs            全套验证流水线（test ×3 → sim → build，--fast 给 hook 用）
+  install-hooks.mjs     把 core.hooksPath 挂到 scripts/hooks/（npm install 自动执行）
+  hooks/pre-commit      commit 前快检：单测 ×1 + build
   probe-geom.cjs        调参诊断：拍面高度参照、自适应喂球高度、回球落点/撞墙高度
   probe-move.cjs        调参诊断：四种站位（原地/追球/站±2m）各打 10 秒，看走位对命中率的影响
   probe-scan2.cjs       调参诊断：逐仰角扫描一次出球，对比「竖平面窗口」与「拍面盘形」两种回球判据

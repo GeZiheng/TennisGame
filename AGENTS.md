@@ -115,9 +115,12 @@ npm run dev           # 只在本机看画面：HTTP + 5173
 npm run build         # tsc --noEmit + vite build
 npm test              # 77 项单测（把 core 编译到 .tmp-test 再跑）
 npm run sim           # 端到端：五档力度 × 6 种子（编译到 .tmp-sim）
+npm run verify        # 全套验证：test ×3 → sim → build
 ```
 
-**改完代码必须跑三件事**：`npm test`（**连跑 3 次**，有随机散布，单次通过不算稳）→ `npm run sim`（30/30 才算过）→ `npm run build`。
+**改完代码跑一条命令**：`npm run verify` —— 依次 `npm test` ×3（有随机散布，单次通过不算稳）→ `npm run sim`（30/30 才算过）→ `npm run build`，任一步失败立即停止并以非零码退出，末尾按改动文件提示该跑哪个 probe。`sim` 排在 probe 之前，是因为诊断脚本要读 `.tmp-sim` 的编译产物。
+
+`npm install` 会通过 `prepare` 自动把 `core.hooksPath` 指向 `scripts/hooks/`，之后每次 `git commit` 先跑快检（`npm test` ×1 + `npm run build`）。**快检只是兜底，不是全套**：随机散布与整局对拉仍以手动 `npm run verify` 为准。需要重挂 hook 时执行 `node scripts/install-hooks.mjs`。
 
 诊断脚本（都从 `.tmp-sim` 读产物，**先跑一次 `npm run sim` 或 `npm test` 编译**）：
 
@@ -140,7 +143,7 @@ npm run sim           # 端到端：五档力度 × 6 种子（编译到 .tmp-si
 
 1. 先读对应模块的注释，`court.ts` 每个常量上面都有「为什么是这个值」。
 2. 改常量前先跑一次 `npm run sim` 拿基线。
-3. 改完跑三项验证；涉及喂球加跑 `probe-feed*`，涉及挥拍加跑 `probe-swing`。
+3. 改完跑 `npm run verify`；涉及喂球加跑 `probe-feed*`，涉及挥拍加跑 `probe-swing`（verify 末尾会按改动文件提示）。
 4. 改了测试断言，问自己「这条在保护什么行为」。不要为了变绿而放宽。
 5. 同步 `README.md` 的参数表，并在 `docs/history.md` 追加当天一段。
 

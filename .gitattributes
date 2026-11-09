@@ -1,0 +1,3 @@
+# git hook 由 sh 直接执行，shebang 后面若带 \r 会解析失败。
+# 钉死 LF，保证 clone / checkout 之后 pre-commit 仍可执行。
+scripts/hooks/pre-commit text eol=lf

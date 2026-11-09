@@ -25,6 +25,8 @@ npm test
 2. 编译输入是 `scripts/test.mjs` 里**写死的 11 个文件**（`protocol / imu / attitude / vec / court / gyro / swing / racket / physics / rally` + `play/stats`）。**新增 core 模块必须同时加到 `scripts/test.mjs` 和 `scripts/sim.mjs` 的输入列表**，否则 require 不到；两处参数目前逐行相同。
 3. `test.mjs` 刻意不删 `.tmp-test/` 目录（删除拦截器会挡递归删除，tsc 会覆盖同名产物）。代价是目录里可能留旧文件：**别写成 `require('./court.js')` 漏掉 `/core/`**，那会静默加载过时物理，症状很像物理 bug。同理 `.tmp-sim/` 是 `npm run sim` 的产物，probe 脚本从那里读编译结果。
 
+改动后的固定流程见 `AGENTS.md` 第 3 节：`npm run verify`（`test` ×3 → `sim` → `build`），`git commit` 前由 `scripts/hooks/pre-commit` 跑快检。probe 依赖 `.tmp-sim`，所以必须排在 `sim` 之后。
+
 ## 8.2 验证分工，别混为一谈
 
 | 层 | 入口 | 跑什么 | 能回答什么 | 覆盖不到的 |

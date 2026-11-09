@@ -12,7 +12,9 @@
     "preview": "vite preview --host",
     "test": "node scripts/test.mjs",
     "test:signal": "node scripts/signal-smoke.mjs",
-    "sim": "node scripts/sim.mjs"
+    "sim": "node scripts/sim.mjs",
+    "verify": "node scripts/verify.mjs",
+    "prepare": "node scripts/install-hooks.mjs"
   },
   "dependencies": {
     "@types/qrcode": "^1.5.6",
