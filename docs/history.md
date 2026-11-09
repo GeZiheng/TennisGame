@@ -225,3 +225,27 @@ P1 手感闭环：`vec` / `court` / `swing` / `physics` / `rally` / `audio`。�
 验证：77 项 ×10 连跑零失败、sim 3 × 30/30、build 通过；`probe-swing` 显示跟随关时竖挥 30°/60°/90° 全部「未接触」，跟随开后全部「打中」。
 
 **但没有真机验证。** 见 `AGENTS.md` 第 0 节。
+
+---
+
+## 4.7 2026-11-10 · 磁盘清理 + 死导出 + 注释同步（不改行为）
+
+**需求**：盘点可清理文件与可精简代码，先做零风险那一批。真机症状（7.1）尚未验证，因此**不碰 core 行为**。
+
+改动：
+
+- **磁盘**：删掉 `.tmp-p3/`（59MB，11-02 遗留的 Edge 用户数据目录，全项目无引用）、`dist/`、`dev-https.log`，以及 `.tmp-test/` 顶层 11 个陈旧编译/调试文件（8 个 11-02 的旧 `core/*.js` 与 3 个 11-03 的 probe）。`.tmp-test/core` 与 `.tmp-sim/core` 由验证重新生成，保持干净。
+  - 顺带消除一个真实隐患：`.tmp-test/` 顶层曾与 `core/` 并存旧版 `court.js` / `physics.js`，写成 `require('.tmp-test/court.js')`（漏 `/core/`）会静默加载过时物理，症状很像物理 bug。
+- **删零引用导出**：`court.ts` 的 `HIT_HALF_X` / `HIT_MIN_Y` / `HIT_MAX_Y` / `WALL_MIN_Y`（连同两段描述其用途、但实际不存在的废注释）、`imu.ts` 的 `qToEulerDeg`、`attitude.ts` 的 `stripYaw`、`vec.ts` 的 `vec` / `vadd` / `vclone` / `lerp`。仅测试使用的 `IDLE_POSE` / `faceCovers` **保留**。
+- **同步 10 处注释漂移**：清单见 `docs/known-issues.md` 7.2。另修 `scene.ts` 对已删常量 `HIT_HALF_X` 的引用、`docs/motion-accuracy.md` 对已删 `stripYaw` 的引用（改为 `qYaw`）。`feedVy` 文档补明「仅作兜底」而非已被取代。
+- `README.md` 的落点-速度表格按 `probe-feed-scan2.cjs` 在拍面高 1.6m 的当前输出校准了两处数值（缓升区间、3.0m 落点的顶点位置），不是凭印象重写。
+
+验证：`npm test` 连跑 3 次均 77 项通过；`npm run sim` 30/30（0 漏接 / 0 撞网）；`npm run build` 通过。
+
+**明确未做**（留给真机取证之后）：8+ 份弹道前推循环的合并、`feedBounce()` 拆分、`test.mjs` / `sim.mjs` 编译参数合并、`assets/低面数网球拍.glb` 与 `public/models/racket.glb` 的重复资产、`vite.config.https.ts` 的不可达 `basicSsl` 分支。
+
+## 4.8 2026-11-10 · 补测试说明文档（纯文档）
+
+**需求**：说清 `tests/` 测的是什么，并留一份可查的说明。
+
+新增 `docs/testing.md`（第 8 节）：运行链路（tsc → `.tmp-test` 编译产物 → `run.cjs`）、验证分层分工、13 个分组逐组覆盖点（77 项）、9 条不能删的反证、加新测试的约定与盲区。`AGENTS.md` 文档地图与 `README.md` 测试章各加一行指针，**未改任何代码与测试**。

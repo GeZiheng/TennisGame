@@ -9,9 +9,6 @@
 export type V3 = [number, number, number];
 export type Quat4 = [number, number, number, number];
 
-export const vec = (x = 0, y = 0, z = 0): V3 => [x, y, z];
-
-export const vadd = (a: V3, b: V3): V3 => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
 export const vsub = (a: V3, b: V3): V3 => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
 export const vmul = (a: V3, s: number): V3 => [a[0] * s, a[1] * s, a[2] * s];
 export const vdot = (a: V3, b: V3): number => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
@@ -28,8 +25,6 @@ export function vnorm(a: V3): V3 {
   const l = vlen(a);
   return l > 1e-9 ? [a[0] / l, a[1] / l, a[2] / l] : [0, 0, 0];
 }
-
-export const vclone = (a: V3): V3 => [a[0], a[1], a[2]];
 
 /** 用四元数旋转向量（等价于 three 里 Vector3.applyQuaternion）。 */
 export function vrot(q: Quat4, v: V3): V3 {
@@ -87,8 +82,6 @@ export function qslerp(a: Quat4, b: Quat4, t: number): Quat4 {
 }
 
 export const clamp = (v: number, lo: number, hi: number): number => (v < lo ? lo : v > hi ? hi : v);
-
-export const lerp = (a: number, b: number, t: number): number => a + (b - a) * t;
 
 /** 线性插值两个位置，用来还原「两帧之间球穿过某个平面」的精确交点。 */
 export const vlerp = (a: V3, b: V3, t: number): V3 => [

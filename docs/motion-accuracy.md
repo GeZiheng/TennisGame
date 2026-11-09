@@ -178,7 +178,7 @@ out = qMul(qMount, qAbs);
 - **倾斜（pitch/roll）用 `deviceorientation` 的 β/γ**：重力参考，不会漂，也不受磁干扰
 - **朝向（yaw）用 `rotationRate` 积分**：不含磁力计，没有跳变；缺点是零偏漂移
 
-实现上就是 `stripYaw(qAbs)` 取倾斜，yaw 单独用陀螺积分，最后 `q = yawQuat(yaw) · qTilt`。
+实现上是先用 `qYaw(qAbs)` 分离朝向、只取倾斜部分 `qTilt`，yaw 单独用陀螺积分，最后 `q = yawQuat(yaw) · qTilt`。
 
 取舍：磁跳变是「突然转 30°」，玩家立刻能察觉；陀螺漂移是「一分钟漂几度」，不容易注意，而且每球断球时可以静默重新对齐。**对网球这个场景，漂移比跳变好接受得多。**
 

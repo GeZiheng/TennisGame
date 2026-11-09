@@ -62,11 +62,6 @@ export function yawQuat(yaw: number): Quat {
   return [0, Math.sin(yaw / 2), 0, Math.cos(yaw / 2)];
 }
 
-/** 去掉绕世界 Y 轴的朝向，只保留倾斜。 */
-export function stripYaw(q: Quat): Quat {
-  return qNormalize(qMul(yawQuat(-qYaw(q)), q));
-}
-
 /**
  * 把绝对姿态转成「朝向归零」的输出：倾斜完全照搬手机，朝向相对启动瞬间。
  *

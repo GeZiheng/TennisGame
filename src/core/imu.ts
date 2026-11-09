@@ -127,13 +127,3 @@ export class ImuTracker {
   }
 }
 
-/** 四元数 → 欧拉角（度），只用于界面显示。 */
-export function qToEulerDeg(q: Quat): { pitch: number; yaw: number; roll: number } {
-  const [x, y, z, w] = q;
-  const sinp = 2 * (w * y - z * x);
-  const pitch = Math.abs(sinp) >= 1 ? (Math.sign(sinp) * Math.PI) / 2 : Math.asin(sinp);
-  const yaw = Math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z));
-  const roll = Math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y));
-  const d = 180 / Math.PI;
-  return { pitch: pitch * d, yaw: yaw * d, roll: roll * d };
-}
