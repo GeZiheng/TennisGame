@@ -1,5 +1,5 @@
-import { ImuTracker, type Quat } from '../core/imu';
-import { qYaw, toOutputQuat } from '../core/attitude';
+import { ImuTracker, qConj, qMul, qNormalize, IDENTITY, type Quat } from '../core/imu';
+import { qAngle, qYaw, toOutputQuat } from '../core/attitude';
 import { MotionSource, DemoSource, type SampleSource } from './sensors';
 import { diagnose, noEventsIssue, isFatal, type EnvFacts, type EnvIssue } from './env';
 import { Link, type LinkState } from '../net/link';
@@ -54,6 +54,26 @@ let origin: Quat = [0, 0, 0, 1];
  * 某个方向；扣掉这个初值，朝向就变成「相对启动瞬间」，而倾斜仍然是绝对真实的。
  */
 let yawZero: number | null = null;
+
+/* ---------------- 姿态连续性 ---------------- */
+
+/**
+ * 一次挥拍中段角速度可达 20 rad/s；方向事件 25–35Hz 下相邻两帧最多约 0.8 rad。
+ * 超过 1.2 rad（≈69°）就不是真实旋转，而是 deviceorientation 在万向锁附近
+ * 换了欧拉角的解分支——采信它会让整只拍子翻过去，并且停在新分支上，
+ * 表现就是「挥几次之后拍子和手机差很多」。
+ */
+const MAX_POSE_JUMP = 1.2;
+/** 连续外推超过这么久就重新接受绝对姿态：玩家可能真的转过去了。 */
+const MAX_EXTRAP_MS = 500;
+
+let lastGoodAbs: Quat | null = null;    // 上一次被接受的绝对姿态
+let extrapBase: Quat | null = null;     // 外推基准（最后一次可信输出）
+let trackerAtBase: Quat | null = null; // 那一刻的陀螺积分快照
+let extrapMs = 0;
+let poseMode: 'absolute' | 'extrap' | 'gyro' = 'gyro';
+let currentQ: Quat = [...IDENTITY];
+let lastPoseAt = 0;
 
 let seq = 0;
 let peakG = 0;
@@ -162,6 +182,7 @@ source.onSample = (s) => {
 
   const a = Math.hypot(s.accel[0], s.accel[1], s.accel[2]);
   const w = Math.hypot(s.gyro[0], s.gyro[1], s.gyro[2]);
+  advancePose(s.dtMs);
   if (a > peakG) peakG = a;
   if (w > peakW) peakW = w;
 
@@ -184,19 +205,61 @@ source.onError = (msg) => {
 
 /* ---------------- 发送循环 ---------------- */
 
+/** 方向事件中断 / 跳变期间，用陀螺积分的增量顶上；恢复后由绝对姿态接管。 */
+function extrapolate(): Quat {
+  if (!extrapBase || !trackerAtBase) return tracker.relativeTo(origin);
+  const delta = qMul(qConj(trackerAtBase), tracker.snapshot()); // 设备系增量
+  return qNormalize(qMul(extrapBase, delta));
+}
+
 /**
- * 当前该发给大屏的姿态。
+ * 每帧推进一次输出姿态。
  *
- * 优先用系统融合出来的绝对姿态：手机怎么摆，球拍就怎么摆，倾角完全对得上，
- * 而且不会越用越歪。只有拿不到方向事件时才退回陀螺仪积分的相对姿态。
+ * 绝对姿态是权威（系统融合，俯仰横滚有重力参考、不会漂）；陀螺积分只在方向
+ * 事件短时中断或单帧跳变时提供增量，所以误差不会跨拍累积。关键的一点：
+ * `latestAbs` 在事件停止后**不会**自动变 null，必须靠 `hasAbsolute` 判新鲜度，
+ * 否则拍子会僵在最后一次挥拍瞬间的姿态上，手机回到准备姿势也不跟回来。
  */
-function currentOut(): Quat {
+function advancePose(dtMs: number) {
+  // onSample 与 sendFrame 都可能触发：有些机型只有方向事件、没有 devicemotion，
+  // 只挂在其中一个上，另一类机型的拍子就会完全不动。同一帧只推进一次，
+  // 避免外推计时被走两遍。
+  const at = performance.now();
+  if (at - lastPoseAt < 4) return;
+  lastPoseAt = at;
+
   const abs = source.latestAbs ?? null;
-  if (abs) {
-    if (yawZero === null) yawZero = qYaw(abs);
-    return toOutputQuat(abs, yawZero);
+  const fresh = source.hasAbsolute === true;
+  if (abs && yawZero === null) yawZero = qYaw(abs);
+  const raw = abs && fresh && yawZero !== null ? toOutputQuat(abs, yawZero) : null;
+
+  if (raw) {
+    const jump = lastGoodAbs ? qAngle(raw, lastGoodAbs) : 0;
+    const tooLong = extrapMs > MAX_EXTRAP_MS;
+    if (!lastGoodAbs || jump <= MAX_POSE_JUMP || tooLong) {
+      lastGoodAbs = raw;
+      extrapBase = raw;
+      trackerAtBase = tracker.snapshot();
+      extrapMs = 0;
+      poseMode = 'absolute';
+      currentQ = raw;
+      return;
+    }
+    // 单帧跳变：这一帧的绝对姿态不可信，继续沿陀螺增量走
+    poseMode = 'extrap';
+    extrapMs += dtMs;
+    currentQ = extrapolate();
+    return;
   }
-  return tracker.relativeTo(origin);
+
+  poseMode = extrapBase ? 'extrap' : 'gyro';
+  extrapMs += dtMs;
+  currentQ = extrapolate();
+}
+
+/** 只读：发送循环和姿态示意取同一份结果，避免两处各自推进状态。 */
+function currentOut(): Quat {
+  return currentQ;
 }
 
 /**
@@ -216,6 +279,7 @@ function sendFrame() {
     if (w > peakW) peakW = w;
   }
 
+  advancePose(16.7);
   const qOut = currentOut();
   const tSend = performance.now();
 
@@ -284,9 +348,10 @@ function startUiLoop() {
 
     // 姿态来源要一眼可见：退化成陀螺仪时会漂、起始倾角也是错的，
     // 那种状态下「球拍和手机对不上」不是 bug，是权限没给
-    const abs = !!source.latestAbs;
-    poseSrcEl.textContent = abs ? '绝对姿态' : '陀螺仪';
-    poseSrcEl.className = `rate ${abs ? 'good' : 'warn'}`;
+    // 三态要如实显示：以前用 !!source.latestAbs，方向事件明明停了还亮绿灯。
+    const label = poseMode === 'extrap' ? '姿态外推' : poseMode === 'gyro' ? '陀螺仪' : '绝对姿态';
+    poseSrcEl.textContent = label;
+    poseSrcEl.className = `rate ${poseMode === 'absolute' ? 'good' : 'warn'}`;
   }, 1000);
 }
 
@@ -434,6 +499,11 @@ async function begin() {
       if (msg.t === 'recal') {
         origin = tracker.snapshot();
         yawZero = null; // 把当前朝向重新当作正前方
+        // 清掉连续性状态，下一帧直接以当前绝对姿态为新的可信基准
+        lastGoodAbs = null;
+        extrapBase = null;
+        trackerAtBase = null;
+        extrapMs = 0;
         link?.sendCtrl({ t: 'recal-ack', at: performance.now() });
       } else if (msg.t === 'ping') {
         // 必须回 pong，否则大屏那边的时钟同步永远收敛不了：

@@ -5,8 +5,9 @@
  * 拍面中心挂在 0.6m 杆末：转 30° 平移 0.31m，转 90° 平移 0.85m，
  * 而判定椭圆半轴只有 0.20m。球如果照着「挥拍前」的位置飞，到达时拍面已经挥走。
  *
- *   老做法（跟随关）：球路完全按发球时瞄准的位置走 → 挥得越多越打不到
- *   现在（跟随开）  ：球在最后半秒跟着拍面中心走（Rally.steerToRacket）
+ *   现在球不再跟随拍面：飞行途中方向不被修改，只在落地弹起那一刻由
+ *   `Rally.aimArrival` 瞄一次。这个探针量的是「挥拍转角越大，球到面时
+ *   离拍面中心多远」，也就是物理上玩家必须自己对准的那段缺口。
  *
  *   node scripts/probe-swing.cjs
  */
@@ -69,12 +70,7 @@ function strokeAt(t) {
 }
 
 /** 只跑第一颗球：跑久了后面的球会轮流喂过来，把结论冲掉 */
-function run({ axis, phiMax, follow }) {
-  // 关掉跟随时把 steerToRacket 换成空函数
-  const proto = Object.getPrototypeOf(new Rally());
-  const orig = proto.steerToRacket;
-  if (!follow) proto.steerToRacket = () => {};
-
+function run({ axis, phiMax }) {
   const r = new Rally();
   const realRandom = Math.random;
   Math.random = () => 0.5; // 关掉横向扰动，只看纵向这条链路
@@ -119,7 +115,6 @@ function run({ axis, phiMax, follow }) {
     return { nearest, hit, missed };
   } finally {
     Math.random = realRandom;
-    proto.steerToRacket = orig;
   }
 }
 
@@ -136,17 +131,13 @@ for (const [label, axis] of [
   ['绕竖直轴（法线方向）', [0, 0, 1]],
 ]) {
   console.log(`== ${label} ==`);
-  console.log('转角   跟随关（老做法）             跟随开（现在）');
-  console.log('─'.repeat(72));
+  console.log('转角   球到面时距拍面中心   判定');
+  console.log('─'.repeat(48));
   for (const phiMax of [0, 15, 30, 45, 60, 90, 120]) {
-    const off = run({ axis, phiMax, follow: false });
-    const on = run({ axis, phiMax, follow: true });
-    const cell = (res) => {
-      const d = res.nearest ? `${res.nearest.d.toFixed(2)}m` : ' —  ';
-      const verdict = res.hit ? '打中' : res.missed === 'reach' ? '够不着' : res.missed === 'late' ? '漏接' : '未接触';
-      return `${d.padEnd(7)} ${verdict}`.padEnd(26);
-    };
-    console.log(`${String(phiMax).padStart(3)}°   ${cell(off)} ${cell(on)}`);
+    const res = run({ axis, phiMax });
+    const d = res.nearest ? `${res.nearest.d.toFixed(2)}m` : ' —  ';
+    const verdict = res.hit ? '打中' : res.missed === 'reach' ? '够不着' : res.missed === 'late' ? '漏接' : '未接触';
+    console.log(`${String(phiMax).padStart(3)}°   ${d.padEnd(18)} ${verdict}`);
   }
   console.log('');
 }

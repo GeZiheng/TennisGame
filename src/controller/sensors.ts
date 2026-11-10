@@ -248,6 +248,8 @@ export interface SampleSource {
   readonly absAt?: number;
   /** 姿态采样率（Hz），最近 1 秒的方向事件数 */
   readonly poseHz?: number;
+  /** 方向事件是否新鲜（500ms 内有数据）。陈旧姿态不能当成当前姿态发出去。 */
+  readonly hasAbsolute?: boolean;
   /** 角速度取自哪条通道；假数据源没有这个概念 */
   readonly gyroSource?: GyroSource;
   /** 取当前角速度（已包含 rotationRate → 姿态差分的自动兜底） */

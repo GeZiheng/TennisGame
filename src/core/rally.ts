@@ -36,9 +36,6 @@ import {
   FEED_APEX_BACK_MAX,
   FEED_APEX_LEAD,
   FACE_CY,
-  STEER_LEAD_S,
-  STEER_VMAX,
-  STEER_ACC,
 } from './court';
 import { vrot, type Quat4, type V3 } from './vec';
 
@@ -231,8 +228,8 @@ export class Rally {
     }
 
     const prevP: V3 = [this.ball.p[0], this.ball.p[1], this.ball.p[2]];
-    // 来球在飞行途中轻微「盯人」：玩家发球后才挪步也能接得到。
-    if (this.phase === 'incoming') this.steerToRacket(dt);
+    // 来球飞行途中不再被改方向：球只按自己的弹道走。瞄准只发生在发球
+    // （serve）和落地弹起那一刻（aimArrival），这是发球机，不是追踪弹。
     // 这一帧的起始时刻。物理子步要按真实时刻去做拍面求交，
     // 不能用帧结束时刻——球在一帧里会走 70cm。
     const t0 = now - dt * 1000;
@@ -483,62 +480,6 @@ export class Rally {
     return null;
   }
 
-  /**
-   * 来球在最后半秒「跟着拍面走」。
-   *
-   * ## 为什么必须跟
-   *
-   * 球拍是「握点固定、绕握点旋转」的杆子——手机只给角度，给不出手的位置。
-   * 拍面中心挂在 0.6m 杆末，玩家一挥拍它就绕握点扫出去：转 30° 移 0.31m，
-   * 转 60° 移 0.60m，而判定椭圆半轴只有 0.20m。球如果照着「挥拍前」的位置飞，
-   * 到达时拍面已经挥走了——屏幕上就是「球从拍子里穿过去」。
-   *
-   * 拍面不能钉死（那就没法挥拍了），所以让球在临近时跟上：球飞了十米，
-   * 最后三米本来就是进击球准备的一段，轻微修正看不出来；一旦跟住，
-   * 挥到哪里球就在哪里，判定自然成立。
-   *
-   * ## 做法：改方向，不改速率
-   *
-   * 直接求「t 秒后到达目标点」的速度 `to / t`。因为 t 就是用剩余距离除以当前
-   * 速率算出来的，这个期望速度的模长**正好等于当前速率**——球只是被轻轻带向拍面，
-   * 不会忽快忽慢。横向、竖直、纵向（拍面被挥到身前时 z 也会变）一次修完。
-   *
-   * 只修最后 STEER_LEAD_S：更早动手球路会明显拐弯，落点也就不再是「视觉节拍器」。
-   * `to[2] <= 0`（拍面已经在球身后）时不再干预——那时球已经飞过去了，
-   * 让方向倒转只会看起来像穿模。
-   */
-  private steerToRacket(dt: number) {
-    const pose = this.rackets.last;
-    if (!pose) return;
-    const b = this.ball;
-    // 只在**弹起之后**介入。落地之前改方向会挪动落点本身——那正好毁掉
-    // 「落点 = 视觉节拍器」这个设计，玩家学不会时机。
-    if (b.bounces < 1) return;
-    if (b.v[2] <= 0.5) return;
-
-    const face = faceCenter(pose);
-    // 目标 = 拍面中心 + 这一球的散布（发球时抽定，这里只负责送到，不重抽）
-    const tx = face[0] + this.aimDx;
-    const ty = face[1] + this.aimDy;
-    const to: V3 = [tx - b.p[0], ty - b.p[1], face[2] - b.p[2]];
-    if (to[2] <= 0.02) return;
-
-    const speed = Math.hypot(b.v[0], b.v[1], b.v[2]);
-    if (speed < 0.5) return;
-    const dist = Math.hypot(to[0], to[1], to[2]);
-    const t = dist / speed;
-    if (t > STEER_LEAD_S) return;
-
-    // 速率保持不变的期望速度：t 秒后正好到目标点
-    const want: V3 = [to[0] / t, to[1] / t, to[2] / t];
-    const cap = STEER_VMAX;
-    const d = STEER_ACC * dt;
-    for (let i = 0; i < 3; i++) {
-      const g = Math.max(-cap, Math.min(cap, want[i]));
-      b.v[i] += Math.max(-d, Math.min(d, g - b.v[i]));
-    }
-  }
-
   /* ---------------- 球的事件 ---------------- */
 
   /**
@@ -568,18 +509,17 @@ export class Rally {
     // 不再预测「球到达时拍面会在哪」。
     //
     // 以前会按拍面中心 120ms 的位移外推，但拍面中心的速度**混着挥拍旋转**：
-    // 手腕一转就是 4 m/s，被当成走位速度会把球瞄到半米开外。而且这一段之后
-    // 还有专门的后半程（steerToRacket）每帧把球送到拍面上，落地重瞄只要
-    // 把球送到「此刻的拍面」附近就够了。
+    // 手腕一转就是 4 m/s，被当成走位速度会把球瞄到半米开外。飞行途中也不再
+    // 修改球的方向，所以这是整条弹道上最后一次瞄准机会，只瞄「此刻的拍面」。
     const aimX = face[0];
     const aimY = face[1];
 
-    // 目标 = 拍面中心 + 这一球的散布，和后半程的跟随（steerToRacket）同一个式子。
+    // 目标 = 拍面中心 + 这一球的散布，和发球时的瞄准同一个式子。
     //
     // 这里踩过的坑值得留着：曾经写成「拍面中心 + 本球偏移」，而玩家会跟着球挪半步——
     // 拍面移到球的位置，重瞄再按「拍面 + 偏移」算一遍，球又被推一份，正反馈，
-    // 球越推越远，最后判「够不着」。现在重瞄和跟随的目标都是「当前拍面 + 固定散布」，
-    // 拍面动球才动，不再是「球的位置决定下一次目标」。
+    // 球越推越远，最后判「够不着」。现在重瞄的目标始终是「当前拍面 + 固定散布」，
+    // 目标只随拍面动，不再是「球的位置决定下一次目标」。
     const tx = aimX + this.aimDx;
     const ty = aimY + this.aimDy;
 
@@ -665,7 +605,7 @@ export class Rally {
     // 每球抽一次「顶点偏移」：横向 ±FEED_APEX_DX、竖直 ±FEED_APEX_DY。
     //
     // 这是「不用每次都送到拍面中心」的落地点：偏移抽定后存成字段，
-    // 后面的落地重瞄和飞行跟随都瞄「拍面中心 + 这个偏移」，不会再叠第二遍。
+    // 后面的落地重瞄也瞄「拍面中心 + 这个偏移」，不会再叠第二遍。
     // 幅度上限由判定盘决定：等效半轴横向 0.203、竖向 0.243，
     // 取 0.12 / 0.10 保证「时机对了也一定在盘内」，但甜区读数会明显散开。
     this.aimDx = (Math.random() - 0.5) * 2 * FEED_APEX_DX;

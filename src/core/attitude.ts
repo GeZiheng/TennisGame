@@ -58,6 +58,17 @@ export function qYaw(q: Quat): number {
   return Math.atan2(-2 * (x * z - w * y), 1 - 2 * (y * y + z * z));
 }
 
+/**
+ * 两个四元数之间的夹角（弧度，0..π）。q 与 -q 表示同一个旋转，取 |dot| 消除符号。
+ *
+ * 用途：识别 `deviceorientation` 在万向锁附近换欧拉角解分支造成的姿态瞬跳。
+ * 那种跳变不是真实旋转，直接采信会让屏幕上整只拍子翻过去。
+ */
+export function qAngle(a: Quat, b: Quat): number {
+  const d = Math.min(1, Math.abs(a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]));
+  return 2 * Math.acos(d);
+}
+
 export function yawQuat(yaw: number): Quat {
   return [0, Math.sin(yaw / 2), 0, Math.cos(yaw / 2)];
 }

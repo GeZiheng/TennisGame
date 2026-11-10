@@ -13,6 +13,8 @@ import { SwingDetector } from '../core/swing';
 import { Rally, type RallyEvent } from '../core/rally';
 import { HIT_WINDOW_MS, HIT_Z, RACKET_POS } from '../core/court';
 import { MockController } from './mock';
+import { VISION_DEFAULTS } from './vision-math';
+import { VisionTracker } from './vision';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -56,7 +58,42 @@ let fps = 0;
 let mock = new MockController();
 let link: Link | null = null;
 
-const room = (new URLSearchParams(location.search).get('room') ?? randomRoom()).toUpperCase().slice(0, 4);
+const qs = new URLSearchParams(location.search);
+const room = (qs.get('room') ?? randomRoom()).toUpperCase().slice(0, 4);
+
+/**
+ * 视觉走位是实验通道，默认完全关闭：不加参数时这一整条代码不产生任何行为。
+ * ?vision=probe 只显示读数、不接走位；?vision=1 才把左右站位交给摄像头。
+ * 参数见 docs/vision.md，全部有缺省值，真机调色块时不用改代码。
+ */
+const huePresets: Record<string, number> = { magenta: 310, green: 75, blue: 210, yellow: 45, red: 0 };
+const numArg = (key: string, def: number) => {
+  const n = Number(qs.get(key));
+  return Number.isFinite(n) && n > 0 ? n : def;
+};
+const hueArgRaw = qs.get('hue');
+const hueArg = hueArgRaw === null
+  ? VISION_DEFAULTS.hue
+  : (huePresets[hueArgRaw.toLowerCase()]
+    ?? (hueArgRaw.trim() !== '' && Number.isFinite(Number(hueArgRaw)) ? Number(hueArgRaw) : VISION_DEFAULTS.hue));
+const visionMode = qs.get('vision');
+const vision = visionMode === 'probe' || visionMode === '1' || visionMode === 'drive'
+  ? new VisionTracker({
+      mode: visionMode === 'probe' ? 'probe' : 'drive',
+      cfg: {
+        ...VISION_DEFAULTS,
+        hue: hueArg,
+        hueTol: numArg('tol', VISION_DEFAULTS.hueTol),
+        minArea: numArg('minarea', VISION_DEFAULTS.minArea),
+        tauMs: numArg('tau', VISION_DEFAULTS.tauMs),
+        maxX: numArg('range', VISION_DEFAULTS.maxX),
+      },
+      flip: qs.get('flip') === '1',
+      preview: qs.get('preview') !== '0',
+    })
+  : null;
+/** V 键：drive 模式下临时切回键盘，做 A/B 对照用。 */
+let visionOverride = false;
 
 /* ---------------- 连接面板 ---------------- */
 
@@ -354,6 +391,9 @@ function updateHud() {
         : ['环境不稳', 'bad'];
   verdictEl.textContent = verdict[0];
   verdictEl.className = `verdict ${verdict[1]}`;
+
+  // 视觉诊断只在开关打开时才有节点内容；200ms 刷一次就够，别每帧写 DOM。
+  vision?.updateHud();
 }
 
 /* ---------------- 延迟曲线 ---------------- */
@@ -456,6 +496,11 @@ async function boot() {
   setInterval(() => link?.sendCtrl({ t: 'ping', t0: performance.now() }), 700);
   setInterval(updateHud, 200);
   setInterval(drawSpark, 140);
+
+  if (vision) {
+    $<HTMLElement>('vision-hud').hidden = false;
+    void vision.start();
+  }
 }
 
 /* ---------------- 走位 ---------------- */
@@ -469,6 +514,10 @@ async function boot() {
  * 为什么必须有它：严格碰撞上线后，可击球面积就是真实的 30×38cm 拍面，
  * 而球回来的横向落点是 ±1 米级别。拍子不能平移的话，命中率只有两成左右，
  * 玩家会觉得「这游戏判定有问题」，而实际上是「你站着没动」。
+ *
+ * 视觉通道（?vision=1）是另一路输入：摄像头追胸口色块，只给左右 x，
+ * 前后 z 固定在击球面。默认键盘路径一行没改，方便 A/B 对照和随时回退。
+ * 详见 docs/vision.md。
  */
 const PLAYER = {
   x: 0,
@@ -483,6 +532,15 @@ const PLAYER = {
 const held = new Set<string>();
 
 function updatePlayer(dt: number) {
+  // 视觉接管：只写 x，z 固定在击球面，键盘走位整个跳过（两路输入会打架）。
+  // 摄像头没跑起来时退回键盘——权限被拒也不至于把玩家卡在原地。
+  if (vision && vision.mode === 'drive' && vision.running && !visionOverride) {
+    PLAYER.x = vision.x;
+    PLAYER.z = HIT_Z;
+    scene.setRacketBase(PLAYER.x, RACKET_POS[1], PLAYER.z);
+    return;
+  }
+
   let ax = 0;
   let az = 0;
   if (held.has('a') || held.has('arrowleft')) ax -= 1;
@@ -559,6 +617,9 @@ addEventListener('keydown', (e) => {
     packets.reset();
     peakG = 0;
     peakW = 0;
+    // 顺带让手机重新锁一次姿态基准：发现拍子和手机歪了，按 R 就能回正
+    link?.sendCtrl({ t: 'recal' });
+    flashHint('统计已重置 · 姿态重标定');
   }
   if (k === 'x') {
     sfx.unlock();
@@ -566,6 +627,14 @@ addEventListener('keydown', (e) => {
     flashHint(sfx.isMuted ? '静音' : '已开启声音');
   }
   if (k === 'c') rally.reset();
+  if (k === 'v') {
+    if (!vision) flashHint('视觉走位未启用：地址加 ?vision=probe 或 ?vision=1');
+    else if (vision.mode === 'probe') flashHint('只读取证中：右上角是读数，不接管走位');
+    else {
+      visionOverride = !visionOverride;
+      flashHint(visionOverride ? '已切回键盘走位（对照）' : '已交给摄像头走位');
+    }
+  }
   // 浏览器要求用户手势之后才能出声
   sfx.unlock();
 });
@@ -578,6 +647,7 @@ addEventListener('pointerdown', () => sfx.unlock(), { once: true });
 
 addEventListener('beforeunload', () => {
   mock.stop();
+  vision?.stop();
   link?.close();
 });
 

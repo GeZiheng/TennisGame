@@ -100,7 +100,7 @@ function qmul(a, b) {
  *
  * 转角由角速度积分得到（ω = peakW·sin(πu)），绕**局部 x 轴**（拍面横轴）转：
  * 拍面像正手一样从上往下压，拍面中心随之绕握点扫出去 0.3–0.6m。
- * 球能不能跟上，全靠 Rally.steerToRacket。
+ * 球不再追拍面；这里压测的是「拍面真的在转时，物理弹道还能不能命中」。
  */
 function swingDeg(peakW, u) {
   if (u <= 0) return 0;
@@ -151,16 +151,15 @@ function run({ peakW, label, seed }) {
       // 用物理前推算「还有多久到」（predictReach），不用当前速度外推：
       // 来球会先落地再弹起，落地前后速度方向差很远，外推会提前一秒起势。
       //
-      // 目标是 HIT_Z：球会跟在拍面中心后面（Rally.steerToRacket），
-      // 所以按球到达击球面那一刻起势就够；拍面倾斜带来的几厘米差异由跟随吃掉。
+      // 目标是 HIT_Z：球按自己的弹道飞，按球到达击球面那一刻起势就够；
+      // 落地弹起那一次重瞄（aimArrival）已经把球送到拍面附近。
       //
-      // 触发阈值收在 0.12s（而不是起势提前 SWING_MS/2）：球在最后半秒会跟着
-      // 拍面走（steerToRacket 会改球速），提前太多预测就会被跟随改掉，
-      // 起势时刻系统性偏早或偏晚——那是测量误差，不是玩家的问题。
+      // 触发阈值收在 75ms：起势太早会让峰值落在球到面之前，那一下拍面
+      // 已经转过去，球就打不到了。这是玩家的时机，不该由球去补偿。
       // 现在按「球快到了就挥」处理，峰值落在球到面附近，误差在 ±75ms 以内。
       // 直接看「球还有多久到击球面」（z 距离 / z 速度），不用整条弹道前推：
-      // 球在最后半秒会被跟随改方向，predictReach 会把改后的速度再外推一遍，
-      // 时机反而飘。这里只要 75ms 内的判断，线性足够。
+      // 来球中途还会落地弹一次，整条弹道外推会把落地那一拐算进去，时机反而飘。
+      // 这里只要 75ms 内的判断，线性足够。
       const tta = r.ball.v[2] > 0.5 ? (HIT_Z - r.ball.p[2]) / r.ball.v[2] : Infinity;
       if (!hasSwung && swingStart === null && r.phase === 'incoming' && tta > 0 && tta < 0.075) {
         swingStart = now;
@@ -180,8 +179,8 @@ function run({ peakW, label, seed }) {
 
       // ---- 2.2 挥拍时球拍真的在转 ----
       // 转角 = 角速度的积分。绕**局部 x 轴**（拍面横轴）转，等于一次正手压拍：
-      // 拍面中心跟着绕握点扫出 0.3–0.6m。球必须靠 steerToRacket 才追得上，
-      // 追不上就会重现「球从拍子里穿过去」。
+      // 拍面中心跟着绕握点扫出 0.3–0.6m。球不再追拍面，这段缺口由玩家
+      // 自己对准；正常挥拍节奏下球到面时转角还小，落地重瞄已经够用。
       const uSwing = swingStart === null ? -1 : (now - swingStart) / SWING_MS;
       const deg = uSwing < 0 ? 0 : swingDeg(peakW, uSwing);
       const qSwing = qmul(Q, quatAxis([1, 0, 0], deg));
@@ -194,9 +193,8 @@ function run({ peakW, label, seed }) {
 
       // ---- 2.5 走位：球朝我飞来时，朝预测落点跑 ----
       if (r.ball.v[2] > 0.5) {
-        // 朝球的**当前**横向前进，不做弹道外推：球在最后半秒会跟着拍面走，
-        // 用「球当前速度外推」等于追一个已经被跟随改过的位置，两个追索系统
-        // 会互相带偏。直接朝球走，天然收敛。
+        // 朝球的**当前**横向前进，不做弹道外推：来球还要落地弹一次，
+        // 整条弹道外推会把落地那一拐算进去，走位容易追过头。直接朝球走，天然收敛。
         const aim = Math.max(-3, Math.min(3, r.ball.p[0]));
         const step = SPEED * (dt / 1000);
         racketX += Math.max(-step, Math.min(step, aim - racketX));

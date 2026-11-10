@@ -1,8 +1,9 @@
 const assert = require('node:assert');
 const { encodePacket, decodePacket, PACKET_BYTES } = require('./core/protocol.js');
 const { ImuTracker, qConj, qMul, qNormalize } = require('./core/imu.js');
-const { deviceEulerToWorldQuat, qYaw, toOutputQuat } = require('./core/attitude.js');
+const { deviceEulerToWorldQuat, qYaw, toOutputQuat, qAngle } = require('./core/attitude.js');
 const { LatencyWindow, ClockSync, PacketStats } = require('./play/stats.js');
+const { VISION_DEFAULTS, rgbToHsv, hueDistance, hsvHit, buildMask, largestBlob, detect, mapPixelX, lowPass } = require('./play/vision-math.js');
 const { SwingDetector, shotFromStroke } = require('./core/swing.js');
 const { omegaFromQuatDelta } = require('./core/gyro.js');
 const { makeBall, advance, liftOverNet } = require('./core/physics.js');
@@ -121,6 +122,19 @@ t('四元数乘法/共轭自洽 q ⊗ q* = 1', () => {
 });
 
 console.log('姿态换算（设备系 → 世界系）');
+
+t('qAngle 把 q 与 -q 视为同一个旋转', () => {
+  const q = deviceEulerToWorldQuat(30, 45, 20);
+  assert.ok(qAngle(q, q) < 1e-9);
+  assert.ok(qAngle(q, [-q[0], -q[1], -q[2], -q[3]]) < 1e-9);
+});
+
+t('qAngle 能识别 90 度的姿态瞬跳', () => {
+  const a = [0, 0, 0, 1];
+  const b = [0, Math.sin(Math.PI / 4), 0, Math.cos(Math.PI / 4)]; // 绕世界 Y 转 90°
+  assert.ok(Math.abs(qAngle(a, b) - Math.PI / 2) < 1e-9);
+  assert.ok(qAngle(a, [0, Math.sin(Math.PI / 12), 0, Math.cos(Math.PI / 12)]) < Math.PI / 5);
+});
 
 /** 用四元数旋转一个向量 */
 const rot = (q, v) => {
@@ -836,8 +850,9 @@ t('挥拍过程中球拍一直在转，球也必须打得中（真机的主场�
   // 模拟器里曾经球拍位姿全程静止，这条路径从来没被覆盖过——真机上几乎
   // 每一拍都在转，于是「模拟全绿、真机全漏」。
   //
-  // 现在球拍是老老实实绕握点转的（拍面中心会扫出去半米），
-  // 全靠 `steerToRacket` 在最后半秒把球带过去。这条测试就是它的验收。
+  // 现在球拍是老老实实绕握点转的（拍面中心会扫出去半米），球不再追拍面，
+  // 靠发球瞄准 + 落地重瞄把球送到拍面附近。这条测试钉住的是：
+  // 正常的连续摆动节奏下，物理弹道仍然能命中。
   const r = new Rally();
   const dt = 1000 / 60;
   let now = 0;
@@ -933,9 +948,9 @@ function drive(rally, frames, onFrame, opts) {
     now += dt;
     // 走位有速度上限（极速 4.2 m/s ≈ 0.07m/帧）。玩家是走过去的，不是瞬移。
     //
-    // 这条限速不只是「像人」：来球会跟着拍面走（Rally.steerToRacket），
-    // 而拍面又跟着球走，两个完美跟随系统会互相追成高频振荡，
-    // 球到达时偏到盘外。限速把回路打断，和真人走位一致。
+    // 这条限速不只是「像人」：拍面会跟着球走，而走位若用整条弹道外推
+    // 又会追过头，两个预测回路互相带偏，球到达时偏到盘外。
+    // 限速把回路打断，和真人走位一致。
     if (follow && rally.ball.v[2] > 0.1) {
       const want = clamp(predictX(rally.ball), -3, 3);
       const step = 0.07;
@@ -967,7 +982,7 @@ t('发球是弹地喂球：先落一次地，再以腰高送到拍面', () => {
   //   1. 来球在到达拍面之前**必须落地一次**（0 次 = 退回直送，2 次 = 球没送到）
   //   2. 落点在拍面前方 1.3–2.4 米（顶点最远只能到 2.0–2.3m，见 serve 的说明；
   //      取这条带是因为「再远就够不着、再近就变成急升球」两头都试过）
-  //   3. 击球高度贴合拍面中心（来球跟着拍面走，不能"又高又飘"）
+  //   3. 击球高度贴合拍面中心（发球时按此刻的拍面中心瞄，不能"又高又飘"）
   const r = new Rally();
   const dt = 1000 / 60;
   let now = 0;
@@ -1051,43 +1066,35 @@ t('喂球只要求「顶点落在拍面附近」：位置有散布，但都在�
   assert.ok(span > 0.08, `顶点横向应该散开，实际跨度只有 ${span.toFixed(3)}m`);
 });
 
-t('发球之后才走开，球也会跟着换落点（落地重瞄）', () => {
-  // 这一条钉住「落点太远够不到」的根因。发球时瞄的是发球那一刻的拍面，
-  // 而球要飞一秒多——玩家这期间走位/转手机，拍面中心挂在 0.6m 长的杆子末端，
-  // 手机转 30° 它就平移 30cm，比整个拍面还宽。
-  // 补偿点放在「来球在我方半场落地」那一刻：球本来就要剧烈改向，
-  // 横挪几厘米眼睛读不出来，但足够把球重新送到拍面中心。
+t('发球之后走开，球不会跟着换落点（飞行途中不再改方向）', () => {
+  // 反证：以前靠 steerToRacket 在最后 0.55s 把球带向拍面，玩家发球后横移
+  // 1.2m 球照样送到手上——那是追踪弹，不是网球。现在飞行途中不再改方向，
+  // 只在落地弹起那一刻按当时拍面重瞄一次（横向上限 1.6 m/s，2 米飞行约 20cm）。
+  // 所以走开超过重瞄能力之后，第一颗球应该从新站位旁边飞过去（reach）。
   const r = new Rally();
   const dt = 1000 / 60;
   let now = 0;
   let x = 0;
   let servedAt = null;
   let moved = false;
-  const reasons = [];
+  let firstMiss = null;
 
-  for (let i = 0; i < 60 * 9; i++) {
+  for (let i = 0; i < 60 * 9 && firstMiss === null; i++) {
     now += dt;
     if (servedAt === null && r.phase === 'incoming') servedAt = now;
-    // 发球后 0.35 秒横移 1.2 米：比三个拍面还宽，靠「发球时瞄准」是绝对接不到的
+    // 发球后 0.35 秒横移 1.2 米：远超落地重瞄的 20cm 能力
     if (servedAt !== null && !moved && now - servedAt > 350) {
       x = 1.2;
       moved = true;
     }
     r.pushRacket({ t: now, pos: [x, RACKET_POS[1], HIT_Z], q: [0, 0, 0, 1] });
-    // 全程不挥拍：球必须自己飞到拍面中心（然后因为没挥而判 late）
+    // 全程不挥拍；只看第一颗球的死法，后面重新发的球会瞄新站位，不该混进来
     for (const e of r.update(dt / 1000, now)) {
-      if (e.kind === 'miss') reasons.push(e.reason);
+      if (e.kind === 'miss' && firstMiss === null) firstMiss = e.reason;
     }
   }
 
-  assert.ok(
-    reasons.includes('late'),
-    `球应该真的送到新站位上（撞到拍面、等挥拍），实际死法 ${JSON.stringify(reasons)}`
-  );
-  assert.ok(
-    !reasons.includes('reach'),
-    '球不应该从新站位旁边飞过去——落地重瞄没生效'
-  );
+  assert.equal(firstMiss, 'reach', `球不该再追着新站位跑，实际死法 ${firstMiss}`);
 });
 
 t('没挥拍时球不会原速穿过拍面，而是擦框掉下去', () => {
@@ -1143,7 +1150,8 @@ t('站到边上不动，球也要喂到手上', () => {
   // 真机反馈：「一开始不动时还打得到，移动起来之后就打不到了」。
   // 根因是喂球从场地正中发、横向速度随机 ±1.2，落点铺开 ±1.3m——
   // 玩家一按 WASD 走开两米，球就从他身边飞过去，而且屏幕上没有
-  // 「你站歪了多少」的参照，他不知道要回来。现在喂球横向跟着拍面走。
+  // 「你站歪了多少」的参照，他不知道要回来。现在发球按此刻拍面中心定横向起点；
+  // 球一旦飞起来就不再改方向（飞行途中的跟随已撤销）。
   for (const px of [0, 2, -2.5]) {
     const r = new Rally();
     const dt = 1000 / 60;
@@ -1303,7 +1311,7 @@ t('拍面只有 30×38cm：球心偏出 25cm 就打空', () => {
   // 严格碰撞的反证：拍面尺寸真的在限制范围，不是摆设。
   //
   // 原来这条用的是「站着不动」——喂球从场地正中发、横向铺开 ±1.3m，
-  // 不走位自然够不着。现在喂球跟着拍面走（见 serve 的说明），
+  // 不走位自然够不着。现在发球按此刻拍面中心瞄准（见 serve 的说明），
   // 「站着不动」反而成了能打到的那一类，所以直接问几何本身：
   // 同一条水平飞过的球，偏 15cm 中、偏 25cm 不中。
   const pose = { t: 0, pos: [0, RACKET_POS[1], HIT_Z], q: [0, 0, 0, 1] };
@@ -1338,6 +1346,101 @@ t('走位到位时能连续打到球，且甜区偏离是「附近」而不是�
     Math.min(...offs) < 0.9,
     `不该每球都擦着拍框，实际最小偏 ${Math.min(...offs).toFixed(2)}`
   );
+});
+
+console.log('视觉走位（纯计算）');
+
+// 32×24 的合成画面：底色是低饱和浅灰，命中色是品红（h=300，默认 hue=310 ±24）。
+const VW = 32;
+const VH = 24;
+function vframe(paint) {
+  const d = new Uint8ClampedArray(VW * VH * 4);
+  for (let i = 0; i < VW * VH; i++) {
+    const p = i << 2;
+    d[p] = 240; d[p + 1] = 240; d[p + 2] = 240; d[p + 3] = 255;
+  }
+  if (paint) paint(d);
+  return d;
+}
+function vrect(d, x0, y0, x1, y1) {
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      const p = (y * VW + x) << 2;
+      d[p] = 255; d[p + 1] = 0; d[p + 2] = 255;
+    }
+  }
+}
+
+t('rgbToHsv 给出正确的色相、饱和度和明度', () => {
+  const near = (a, b) => assert.ok(Math.abs(a - b) < 1e-6, `${a} ≠ ${b}`);
+  near(rgbToHsv(255, 0, 0).h, 0);
+  near(rgbToHsv(0, 255, 0).h, 120);
+  near(rgbToHsv(0, 0, 255).h, 240);
+  near(rgbToHsv(255, 0, 255).h, 300);
+  near(rgbToHsv(128, 128, 128).s, 0);
+  near(rgbToHsv(128, 128, 128).v, 128 / 255);
+});
+
+t('hueDistance 是环形距离，跨 0/360 不会算成 358 度', () => {
+  assert.strictEqual(hueDistance(359, 1), 2);
+  assert.strictEqual(hueDistance(350, 10), 20);
+  assert.strictEqual(hueDistance(0, 180), 180);
+  assert.strictEqual(hueDistance(310, 310), 0);
+});
+
+t('hsvHit 挡掉低饱和、低明度和色相不符的像素', () => {
+  const c = VISION_DEFAULTS;
+  assert.strictEqual(hsvHit(310, 1, 1, c), true);
+  assert.strictEqual(hsvHit(300, 1, 1, c), true, '品红 300 落在 310±24 内');
+  assert.strictEqual(hsvHit(310, 0.1, 1, c), false, '白墙不能被当成色块');
+  assert.strictEqual(hsvHit(310, 1, 0.1, c), false, '暗背景不能被当成色块');
+  assert.strictEqual(hsvHit(20, 1, 1, c), false, '差 70 度的红色不算');
+});
+
+t('largestBlob 只认最大连通块，同色噪点拽不偏质心', () => {
+  const d = vframe((buf) => {
+    vrect(buf, 10, 8, 16, 14);   // 36 像素的大块
+    vrect(buf, 0, 0, 2, 2);      // 4 像素的干扰块
+  });
+  const blob = largestBlob(buildMask(d, VISION_DEFAULTS), VW, VH);
+  assert.ok(blob, '应该找到色块');
+  assert.strictEqual(blob.area, 36);
+  assert.ok(Math.abs(blob.cx - 12.5) < 1e-6, `质心 x 应为 12.5，实际 ${blob.cx}`);
+  assert.ok(Math.abs(blob.cy - 10.5) < 1e-6, `质心 y 应为 10.5，实际 ${blob.cy}`);
+});
+
+t('largestBlob 空掩码返回 null', () => {
+  assert.strictEqual(largestBlob(buildMask(vframe(), VISION_DEFAULTS), VW, VH), null);
+});
+
+t('detect 用面积门槛挡掉小噪点', () => {
+  const small = vframe((buf) => vrect(buf, 3, 3, 6, 6)); // 9 像素 < minArea 24
+  assert.strictEqual(detect(small, VW, VH, VISION_DEFAULTS), null);
+  const big = vframe((buf) => vrect(buf, 10, 8, 16, 14));
+  const b = detect(big, VW, VH, VISION_DEFAULTS);
+  assert.ok(b && b.area === 36, '36 像素的色块必须检出');
+});
+
+t('mapPixelX 线性映射并在两端钳位', () => {
+  const near = (a, b) => assert.ok(Math.abs(a - b) < 1e-6, `${a} ≠ ${b}`);
+  near(mapPixelX(15.5, VW, 1.2), 0);
+  near(mapPixelX(0, VW, 1.2), -1.2);
+  near(mapPixelX(VW - 1, VW, 1.2), 1.2);
+  near(mapPixelX(-20, VW, 1.2), -1.2);
+  near(mapPixelX(999, VW, 1.2), 1.2);
+});
+
+t('lowPass 单调收敛、不过冲，退化参数直通', () => {
+  let x = 0;
+  for (let i = 0; i < 40; i++) {
+    const next = lowPass(x, 1, 250, VISION_DEFAULTS.tauMs);
+    assert.ok(next <= 1 + 1e-9, '低通不能过冲');
+    assert.ok(next >= x, '低通必须单调朝目标收敛');
+    x = next;
+  }
+  assert.ok(x > 0.99, `40 步后应该基本收敛，实际 ${x}`);
+  assert.strictEqual(lowPass(0, 1, 16, 0), 1, 'tau=0 表示不平滑');
+  assert.strictEqual(lowPass(0.4, 1, 0, 250), 0.4, 'dt=0 时保持');
 });
 
 console.log(`\n${pass} 项通过`);

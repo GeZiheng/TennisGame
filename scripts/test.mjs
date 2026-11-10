@@ -36,6 +36,7 @@ execFileSync(
     'src/core/physics.ts',
     'src/core/rally.ts',
     'src/play/stats.ts',
+    'src/play/vision-math.ts',
     '--outDir',
     out,
     // 不写 rootDir 的话，tsc 会按「输入文件的公共父目录」推导，
