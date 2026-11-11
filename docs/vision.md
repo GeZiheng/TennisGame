@@ -65,6 +65,10 @@ npm run dev:https     # 摄像头属于安全上下文，必须 HTTPS
 # 大屏地址后加参数；手机端 controller.html 不用改
 ```
 
+> **拼参数别写第二个 `?`**：如果大屏地址已经带了 `?room=XXXX`（指定房间号），
+> 后面要用 `&` 拼，例如 `https://<大屏地址>/?room=AB12&vision=probe`；
+> `?vision=probe` 这种写法只适用于地址还没有任何 query 的情况。
+
 | 参数 | 默认 | 作用 |
 |---|---|---|
 | `?vision=probe` | 关 | **只读取证**：右上角显示读数，不接 `PLAYER`。第一步先用这个 |

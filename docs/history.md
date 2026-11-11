@@ -343,7 +343,7 @@ P1 手感闭环：`vec` / `court` / `swing` / `physics` / `rally` / `audio`。�
 **改动**（只碰姿态输出，不碰判定 / 弹道 / 喂球 / 协议 / 时钟；`MAX_POSE_JUMP` 一行没动）：
 
 - `src/core/attitude.ts`：新增 `worldYawDelta`（世界系增量四元数 `next·conj(prev)` 读出绕 Y 转角，避开 `qYaw` 的万向锁换分支）、`isYawGimbal`、`YawDriftObserver`。观测器按**相邻帧转角幅度**分离慢漂与真实动作：`< MAX_DRIFT_STEP = 0.05 rad`（≈2.9°/帧）才积分。真机慢漂约 1–2°/s，30–60Hz 下每帧 <0.1°；挥拍中段是十几到几十度，差两个数量级。**刻意不用「静止门控」**——挥拍那几百毫秒里 alpha 一样在漂，只积分静止帧会永久漏掉那部分。
-- `src/controller/main.ts`：`advancePose` 里 `effZero = yawZero + (driftOn ? drift.radians : 0)`，`toOutputQuat(abs, effZero)`。只扣「传感器多转的量」，**不重定义正前方**，因此与握位无关。补偿开启时 `recal` 不再是重锁，而是「先 `yawZero += drift.radians` 固化已扣的补偿，再 `drift.reset()`」；关掉 HUD 开关时同理。**只 reset 不固化会让拍子在这一刻突然歪回累积的漂移量**——这是状态转换的坑，别简化掉。`start()` 新会话是 `yawZero = null` + `drift.reset()`，两者一起归零所以没问题。HUD 新增可点击的「漂移 ±x°」按钮做现场 A/B，含「万向锁」标记；URL 加 `?drift=1` 可直接以开启状态接入。**默认关**：照 `?vision=1` 的先例，未真机验证的能力不默认接管输出。
+- `src/controller/main.ts`：`advancePose` 里 `effZero = yawZero + (driftOn ? drift.radians : 0)`，`toOutputQuat(abs, effZero)`。只扣「传感器多转的量」，**不重定义正前方**，因此与握位无关。补偿开启时 `recal` 不再是重锁，而是「先 `yawZero += drift.radians` 固化已扣的补偿，再 `drift.reset()`」；关掉 HUD 开关时同理。**只 reset 不固化会让拍子在这一刻突然歪回累积的漂移量**——这是状态转换的坑，别简化掉。`start()` 新会话是 `yawZero = null` + `drift.reset()`，两者一起归零所以没问题。HUD 新增可点击的「漂移 ±x°」按钮做现场 A/B，含「万向锁」标记；扫码 URL 末尾追加 `&drift=1` 可直接以开启状态接入（二维码 URL 已带 `?room=XXXX`，不是再写一个 `?`）。**默认关**：照 `?vision=1` 的先例，未真机验证的能力不默认接管输出。
 - `controller.html` / `src/style.css`：HUD 元素与按钮样式。
 - `tests/core.test.cjs`：新增 8 条（当时共 **97 项**、15 个分组）。其中「竖直持握时 gamma 混进世界 Y 转角」是握位依赖的数学反证；「扣掉观测漂移后输出回到启动姿态」是「不重定义正前方」的端到端反证。
 
@@ -380,3 +380,16 @@ P1 手感闭环：`vec` / `court` / `swing` / `physics` / `rally` / `audio`。�
 **明确没做**：没有调 `MAX_POSE_JUMP` 的数值（仍是 1.2 rad，调小会误伤真实挥拍）；没有把球追拍面 / 拍面锚定加回来；没有改大屏 `syncRacket` 的自适应平滑（修好输入后 targetQ 不再跳，改它会引入快挥拍滞后）；没有改慢漂补偿的默认关状态。
 
 验证：`npm run verify` 全套通过（**105 项 ×3、sim 30/30 零漏接零撞网、build**）。**浏览器 DOM 接入、陀螺削顶偏差、网络乱序与真机效果门禁覆盖不到**；取证两组见 `AGENTS.md` 0.4，重点是全力快挥时手机「姿态」是否全程保持「绝对姿态」、挥一分钟后拍子是否还稳。
+
+## 4.15 2026-11-12 · 冗余素材清理 + 文档去重（不改任何运行代码）
+
+**做了两件事，都不是行为改动**：
+
+1. **删掉 3 个运行时零引用的素材**：`assets/低面数网球拍.glb` 与 `public/models/racket.glb` 逐字节相同（md5 `f891144c…`），另两个 STL 是建模中间文件。空的 `assets/` 目录一并移除，456K。4.7 曾把这份重复资产列为「明确没做」的待办，此处销掉。运行时仍只加载 `public/models/racket.glb`。
+2. **README 去重**：567 → 398 行。开发者向的六个章节（姿态链路 / 挥拍检测 / 严格碰撞 / 挥拍时拍面会转 / 回球补偿 / glb 模型尺寸推导）、15 条测试断言清单、61 行逐文件目录、设计取舍，全部收敛成 `docs/` 的指针表。**信息没有删除**，只是各归其位：`docs/algorithms.md` 3.x、`docs/history.md` 4.x、`docs/testing.md` 8.3/8.4 本就写得更完整。README 独有的换模型方法（`GLB_FRAME_HALF_X` / `GLB_FACE_CY`，不要动 `FACE_*`）保留成 5 行；证书安装、环境自检、HUD 六个数、参数表、键位表、落点对照表、视觉走位开关全部原样保留。目录骨架顺带清掉了已删除的 `assets/` 引用。
+
+同步修正：`docs/algorithms.md` 开头分层图里过时的「77 项单测」→ 105 项 / 16 分组；`AGENTS.md` 文档地图的行数与 4.x 编号对齐现状、删掉一处重复的「默认关」、模型一栏不再指向已删除的源文件；`docs/motion-accuracy.md` 开头标明第 4 节「加第二个传感器」已被硬约束否决，是分析不是待办。
+
+**顺带收掉最后一条注释漂移**：`src/play/scene.ts:461` 原写「换上 assets 里的 glb 球拍」，但代码加载的是 `models/racket.glb`；改为直接指向 `public/models/racket.glb`。纯注释，无行为改动。
+
+验证：`npm run verify` 全套通过（105 项 ×3、sim 30/30 零漏接零撞网、build）；本轮唯一的代码改动是 `scene.ts` 一行注释，无行为变化。另做了一次全库交叉引用自检：67 个文档内引用 0 缺失，README 指针表的 13 个节号全部存在。

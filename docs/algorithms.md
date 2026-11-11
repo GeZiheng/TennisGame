@@ -24,7 +24,7 @@ src/play/            大屏端：scene（three.js + glb 球拍）、audio、stat
 src/controller/      手机端：sensors（双通道角速度）、env（环境自检）、main（发送循环）
 server/              Vite 插件 + 信令房间 + /__lanip + /ca.crt
 scripts/             证书、单测跑手、端到端模拟、probe-* 诊断工具
-tests/core.test.cjs  77 项单测
+tests/core.test.cjs  105 项 / 16 分组（见 docs/testing.md）
 ```
 
 ---
