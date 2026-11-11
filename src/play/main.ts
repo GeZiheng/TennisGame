@@ -118,6 +118,11 @@ async function resolveControllerUrl(): Promise<{ url: string; insecure: boolean 
 }
 
 function setLinkState(state: LinkState, detail?: string) {
+  // `ready` = 信令确认「房间里 host 和 peer 都在」，也就是一次新的配对。
+  // 手机重新扫码会重载 controller.html，时钟和包序号都从头开始，而大屏页面
+  // 一直没刷新——必须在数据到达前把上一段连接的状态清干净，见 resetSession()。
+  if (state === 'ready') resetSession();
+
   const map: Record<LinkState, [string, string]> = {
     idle: ['准备中…', ''],
     waiting: ['等待手机接入…', ''],
@@ -151,13 +156,45 @@ function setLinkState(state: LinkState, detail?: string) {
  */
 let lastImuSeq = -1;
 
+/**
+ * 新配对 = 新会话，把只属于「一次连接」的状态全部清掉。
+ *
+ * 大屏页面从不刷新，`Link` 也只在 boot() 里 new 一次；手机那边重新扫码却是
+ * 一个全新的页面：`performance.now()` 归零、包序号从 0 开始、姿态基准重新锁。
+ * 三处残留各自都能单独造成「重连后一球都打不到」：
+ *
+ *   - `ClockSync` 的 offset 停在旧时钟差，而它只采纳「RTT 明显更优」的样本，
+ *     收敛后门限形同锁死 → 挥拍时刻被换算到几万毫秒外，`takeStroke` 的
+ *     ±150ms 窗口一条都匹配不上，连 `peekLive` 抢跑也一起失效；
+ *   - `lastImuSeq` 停在旧的大序号，新会话的包全被当成乱序旧包丢掉，拍子僵住；
+ *   - `SwingDetector` 里可能还留着上次挥到一半的 armed 峰，会被 `peekLive`
+ *     当成「正在挥」误取；`Rally.pending` 里则是时间轴已经错掉的旧挥拍。
+ *
+ * 这些都不属于「一局游戏」，换人就该清零。姿态平滑（`smoothQ`）不清：新会话
+ * 第一包到了会在 22ms 内收敛过去，强行归位反而让拍子凭空跳一下。
+ */
+function resetSession() {
+  clock.reset();
+  swing.reset();
+  lastImuSeq = -1;
+  packets.reset();
+  latency.clear();
+  endToEnd.clear();
+  peakG = 0;
+  peakW = 0;
+  rally.reset();
+  flashHint('手机已接入 · 会话已重置');
+}
+
 function onPacket(pkt: ReturnType<typeof decodePacket>) {
   if (!pkt) return;
   const now = performance.now();
 
   packets.mark(pkt.seq, now);
-  // 重连之后 seq 从 0 重来，先认出来，否则会一直丢弃新连接的包
-  if (lastImuSeq > 1000 && pkt.seq + 1000 < lastImuSeq) lastImuSeq = -1;
+  // 兜底：万一没收到 ready（信令层重连），也要认出新会话的 seq 从 0 重来。
+  // imu 通道无序，正常乱序只差几包；回退 240 包（≈4s @60Hz）只可能是新会话。
+  // 原来写的 1000 包要求上一次连接至少打满 16.7 秒，短会话重连会全量丢包。
+  if (lastImuSeq > 240 && pkt.seq + 240 < lastImuSeq) lastImuSeq = -1;
   if (pkt.seq <= lastImuSeq) return;
   lastImuSeq = pkt.seq;
 

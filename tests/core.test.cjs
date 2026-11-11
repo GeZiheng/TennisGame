@@ -1,7 +1,9 @@
 const assert = require('node:assert');
 const { encodePacket, decodePacket, PACKET_BYTES } = require('./core/protocol.js');
 const { ImuTracker, qConj, qMul, qNormalize } = require('./core/imu.js');
-const { deviceEulerToWorldQuat, qYaw, toOutputQuat, qAngle } = require('./core/attitude.js');
+const { deviceEulerToWorldQuat, qYaw, toOutputQuat, qAngle,
+  worldYawDelta, isYawGimbal, YawDriftObserver,
+  PoseContinuityGate, MAX_POSE_JUMP, MAX_EXTRAP_MS } = require('./core/attitude.js');
 const { LatencyWindow, ClockSync, PacketStats } = require('./play/stats.js');
 const { VISION_DEFAULTS, rgbToHsv, hueDistance, hsvHit, buildMask, largestBlob, detect, mapPixelX, lowPass } = require('./play/vision-math.js');
 const { SwingDetector, shotFromStroke } = require('./core/swing.js');
@@ -217,6 +219,179 @@ t('alpha 变化只改变朝向，不改变倾斜', () => {
   assert.ok(Math.abs(tiltA - tiltB) < 0.5, '倾斜不应随 alpha 改变');
 });
 
+console.log('偏航慢漂观测（alpha 慢漂 / 握位依赖）');
+
+t('两帧纯 yaw 增量能还原，且 q 与 -q 同解', () => {
+  const a = deviceEulerToWorldQuat(20, 75, 10);
+  const b = deviceEulerToWorldQuat(25, 75, 10);
+  const d = (worldYawDelta(a, b) * 180) / Math.PI;
+  assert.ok(Math.abs(d - 5) < 0.2, `应为 5°，实际 ${d.toFixed(2)}°`);
+  const negB = [-b[0], -b[1], -b[2], -b[3]];
+  assert.ok(Math.abs(worldYawDelta(a, negB) - worldYawDelta(a, b)) < 1e-9, 'q 与 -q 不应得到不同结果');
+});
+
+t('纯俯仰变化不该被算成偏航漂移', () => {
+  const a = deviceEulerToWorldQuat(30, 60, 0);
+  const b = deviceEulerToWorldQuat(30, 65, 0);
+  assert.ok(Math.abs(worldYawDelta(a, b)) < 0.02, '俯仰的旋转轴在水平面内，不应投影到世界 Y');
+});
+
+t('竖直持握时 gamma 会混进世界 Y 转角（反手位依赖的数学根因）', () => {
+  // β=90 时 Rx(β-90) 退成单位阵，absolute = Ry(α+γ)：alpha 与 gamma 同轴，
+  // 所以「换握位」在 qYaw 看来和「转身」没区别，重锁正前方必然依赖握位。
+  const a = deviceEulerToWorldQuat(30, 90, 0);
+  const b = deviceEulerToWorldQuat(30, 90, 40);
+  const d = (worldYawDelta(a, b) * 180) / Math.PI;
+  assert.ok(Math.abs(d - 40) < 0.5, `应约 40°，实际 ${d.toFixed(1)}°`);
+});
+
+t('万向锁回退分支必须能被识别', () => {
+  assert.strictEqual(isYawGimbal([0, 0, 0, 1]), false);
+  const gimbalQ = [Math.SQRT1_2, 0, 0, Math.SQRT1_2]; // Rx(90°)，|r12| = 1
+  assert.strictEqual(isYawGimbal(gimbalQ), true);
+});
+
+t('慢漂被积分、挥拍的大转角原样放过，且挥拍后继续积分', () => {
+  const o = new YawDriftObserver();
+  let q = deviceEulerToWorldQuat(0, 90, 0);
+  o.update(q);
+  for (let i = 1; i <= 30; i++) {
+    q = deviceEulerToWorldQuat(i * 0.4, 90, 0); // 每帧 +0.4°，慢漂
+    o.update(q);
+  }
+  assert.ok(Math.abs(o.degrees - 12) < 0.1, `30 帧 ×0.4° 应累积 12°，实际 ${o.degrees.toFixed(2)}°`);
+
+  q = deviceEulerToWorldQuat(12 + 25, 90, 0); // 单帧 25°，一次中等挥拍
+  o.update(q);
+  assert.ok(Math.abs(o.degrees - 12) < 0.1, `挥拍不该计入漂移，实际 ${o.degrees.toFixed(2)}°`);
+  assert.strictEqual(o.skippedSteps, 1);
+
+  q = deviceEulerToWorldQuat(37 + 0.4, 90, 0);
+  o.update(q);
+  assert.ok(Math.abs(o.degrees - 12.4) < 0.1, `挥拍后应继续积分，实际 ${o.degrees.toFixed(2)}°`);
+});
+
+t('换握位的大跳变不会被当成漂移', () => {
+  const o = new YawDriftObserver();
+  o.update(deviceEulerToWorldQuat(10, 90, 0));
+  o.update(deviceEulerToWorldQuat(10, 90, 90)); // 正手 ↔ 反手
+  assert.ok(Math.abs(o.degrees) < 1e-9, `大跳变不该积分，实际 ${o.degrees}`);
+  assert.strictEqual(o.skippedSteps, 1);
+});
+
+t('把观测到的漂移扣进 yawZero 后，输出姿态回到启动那一刻', () => {
+  const start = deviceEulerToWorldQuat(10, 90, 0);
+  const zero = qYaw(start);
+  const out0 = toOutputQuat(start, zero);
+
+  const o = new YawDriftObserver();
+  let q = start;
+  o.update(q);
+  for (let i = 1; i <= 40; i++) {
+    q = deviceEulerToWorldQuat(10 + i * 0.5, 90, 0); // 一路慢漂 20°
+    o.update(q);
+  }
+  const raw = toOutputQuat(q, zero);
+  const fixed = toOutputQuat(q, zero + o.radians);
+  const driftErr = (qAngle(raw, out0) * 180) / Math.PI;
+  const fixedErr = (qAngle(fixed, out0) * 180) / Math.PI;
+  assert.ok(driftErr > 15, `不补偿应歪掉约 20°，实际 ${driftErr.toFixed(1)}°`);
+  assert.ok(fixedErr < 0.5, `补偿后应回正，实际 ${fixedErr.toFixed(1)}°`);
+});
+
+t('reset 后观测归零（对应按 R / 新会话）', () => {
+  const o = new YawDriftObserver();
+  let q = deviceEulerToWorldQuat(0, 90, 0);
+  o.update(q);
+  for (let i = 1; i <= 30; i++) {
+    q = deviceEulerToWorldQuat(i * 0.4, 90, 0);
+    o.update(q);
+  }
+  assert.ok(Math.abs(o.degrees) > 1, '先要真的积到漂移');
+  o.reset();
+  assert.strictEqual(o.radians, 0);
+  assert.strictEqual(o.skippedSteps, 0);
+});
+
+console.log('姿态连续性门（快挥拍 / 解分支跳变）');
+
+t('真实快挥拍越过大转角门限时仍必须采信绝对姿态', () => {
+  const gate = new PoseContinuityGate();
+  const a = deviceEulerToWorldQuat(30, 90, 0);
+  const b = deviceEulerToWorldQuat(30, 90, 100); // 100°，明确超过 1.2rad
+  assert.ok(qAngle(a, b) > MAX_POSE_JUMP, '前提：这一帧确实越过了固定门限');
+  gate.decide(a, 40, false);
+  assert.strictEqual(gate.decide(b, 40, true), true, '传感器在动，不能把真实挥拍判成解分支跳变');
+  assert.strictEqual(gate.extrapTime, 0);
+});
+
+t('静止 / 微动时的大跳变仍要拦下（解分支跳变）', () => {
+  const gate = new PoseContinuityGate();
+  gate.decide(deviceEulerToWorldQuat(30, 90, 0), 40, false);
+  assert.strictEqual(gate.decide(deviceEulerToWorldQuat(30, 90, 100), 40, false), false);
+  assert.ok(gate.extrapTime > 0, '被拦的帧要计入外推时长');
+});
+
+t('跳变只拦一帧：基准不能冻结在跳变前（旧实现会卡满 500ms）', () => {
+  const gate = new PoseContinuityGate();
+  gate.decide(deviceEulerToWorldQuat(30, 90, 0), 40, false);
+  // 换解分支后停在新姿态，之后相邻帧只有很小变化
+  assert.strictEqual(gate.decide(deviceEulerToWorldQuat(30, 90, 100), 40, false), false);
+  assert.strictEqual(gate.decide(deviceEulerToWorldQuat(30, 90, 101), 40, false), true,
+    '下一帧是相邻帧差 1°，应当恢复采信；冻结基准会继续拦到超时');
+});
+
+t('连续外推超过 MAX_EXTRAP_MS 强制重新锚定', () => {
+  const gate = new PoseContinuityGate();
+  gate.decide(deviceEulerToWorldQuat(30, 90, 0), 16.7, false); // 先建立基准帧
+  let accepted = false;
+  let maxExtrap = 0;
+  for (let i = 1; i <= 40; i++) {
+    const q = deviceEulerToWorldQuat(30, 90, i * 100); // 每帧都是大跳变
+    if (gate.decide(q, 16.7, false)) { accepted = true; break; }
+    // 重锚那一帧计时会清零，所以要在采信之前取峰值
+    maxExtrap = Math.max(maxExtrap, gate.extrapTime);
+  }
+  assert.strictEqual(accepted, true, '外推不能无限期卡住');
+  assert.ok(maxExtrap >= MAX_EXTRAP_MS, `强制重锚应发生在超时之后，峰值 ${maxExtrap.toFixed(0)}ms`);
+});
+
+t('方向事件 25Hz + 35rad/s 全程采信，不出现一帧外推', () => {
+  const gate = new PoseContinuityGate();
+  const dtMs = 1000 / 25;
+  const perFrameDeg = (35 * dtMs / 1000) * 180 / Math.PI; // 80°/帧 > 1.2rad
+  for (let i = 0; i < 30; i++) {
+    const q = deviceEulerToWorldQuat(30, 90, i * perFrameDeg);
+    assert.strictEqual(gate.decide(q, dtMs, true), true, `第 ${i} 帧不该被踢进外推`);
+  }
+  assert.strictEqual(gate.extrapTime, 0);
+});
+
+t('reset 后回到「第一帧无条件采信」', () => {
+  const gate = new PoseContinuityGate();
+  gate.decide(deviceEulerToWorldQuat(30, 90, 0), 40, false);
+  assert.strictEqual(gate.decide(deviceEulerToWorldQuat(30, 90, 100), 40, false), false);
+  gate.reset();
+  assert.strictEqual(gate.extrapTime, 0);
+  assert.strictEqual(gate.decide(deviceEulerToWorldQuat(30, 90, 0), 40, false), true);
+});
+
+t('非 Y 轴的微小俯仰不算偏航漂移（避免补偿随机游走）', () => {
+  const o = new YawDriftObserver();
+  o.update(deviceEulerToWorldQuat(30, 60, 0));
+  o.update(deviceEulerToWorldQuat(30, 61.5, 0)); // 纯俯仰 1.5°，投影到 Y 上很小
+  assert.ok(Math.abs(o.degrees) < 0.01, `俯仰不该进漂移累积，实际 ${o.degrees.toFixed(3)}°`);
+  assert.strictEqual(o.skippedSteps, 1);
+});
+
+t('纯 yaw 慢漂仍被完整积分（纯度判据不能误伤）', () => {
+  const o = new YawDriftObserver();
+  let q = deviceEulerToWorldQuat(0, 90, 0);
+  o.update(q);
+  for (let i = 1; i <= 30; i++) o.update(deviceEulerToWorldQuat(i * 0.4, 90, 0));
+  assert.ok(Math.abs(o.degrees - 12) < 0.1, `应累积 12°，实际 ${o.degrees.toFixed(2)}°`);
+});
+
 console.log('统计');
 
 t('分位数取整不越界', () => {
@@ -285,6 +460,40 @@ t('只采纳更优的 RTT 样本，慢样本不污染偏移', () => {
   sync.ingest(0, 5000 + 300, 5000 + 302, 900); // RTT 600，明显是抖动
   const offsetB = sync.toLocal(0);
   assert.ok(Math.abs(offsetA - offsetB) < 1e-6, '慢样本不应改变偏移估计');
+});
+
+t('对端页面重载导致时钟基准突变时，必须重新锚定', () => {
+  // 第一段连接：大屏已跑 40s，手机页面刚打开，球拍时钟比大屏慢 30s
+  const sync = new ClockSync();
+  sync.ingest(40000, 10010, 10012, 40022); // RTT 20
+  assert.ok(Math.abs(sync.offsetMs + 30000) < 1e-6, `初始偏移应约 -30000，实际 ${sync.offsetMs}`);
+  assert.strictEqual(sync.lastRtt, 20);
+
+  // 手机重新扫码、页面重载：performance.now() 归零，时钟差变成 -300000。
+  // 这次 RTT 仍是 20，并不比 bestRtt * 0.9 更优 —— 只认最优样本的老逻辑
+  // 会永远卡在 -30000，把新会话的挥拍时刻算到 270 秒之前。
+  sync.ingest(300000, 10, 12, 300022);
+  assert.ok(
+    Math.abs(sync.offsetMs + 300000) < 1e-6,
+    `应重新锚定到新会话的偏移，实际 ${sync.offsetMs}`
+  );
+  // 手机发出 tSend=1000 的包，换算到大屏应是 301000；沿用旧偏移会算成 31000，
+  // 与 ±150ms 的击球窗口差了六个数量级，每一球都会漏接。
+  assert.ok(Math.abs(sync.toLocal(1000) - 301000) < 1e-6, '重锚后时间戳必须落回大屏当前时基');
+});
+
+t('reset 之后必须重新收敛，不能沿用上一段连接的偏移', () => {
+  const sync = new ClockSync();
+  sync.ingest(40000, 10010, 10012, 40022); // 上一段连接：偏移 -30000
+  assert.ok(sync.isValid);
+
+  sync.reset();
+  assert.ok(!sync.isValid, 'reset 后不能拿旧的 offset 去换算时间戳');
+  assert.strictEqual(sync.offsetMs, 0);
+
+  sync.ingest(0, 5010, 5012, 22); // 新会话：球拍时钟快 5s
+  assert.ok(Math.abs(sync.offsetMs - 5000) < 1e-6, `新偏移应为 5000，实际 ${sync.offsetMs}`);
+  assert.ok(Math.abs(sync.toLocal(8000) - 3000) < 1e-6);
 });
 
 console.log('角速度兜底（由姿态差分反推）');

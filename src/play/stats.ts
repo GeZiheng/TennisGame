@@ -94,7 +94,18 @@ export class PacketStats {
   }
 }
 
-/** 用 ping-pong 估算两端时钟偏移。取 RTT 最小的一次，因为它的测量误差最小。 */
+/**
+ * 用 ping-pong 估算两端时钟偏移。取 RTT 最小的一次，因为它的测量误差最小。
+ *
+ * 但「只认最优样本」有个前提：两端的时钟基准在整段连接里不变。手机重新扫码会
+ * 重新加载页面，`performance.now()` 从 0 开始，时钟差会整段跳变；这时 bestRtt
+ * 已经收敛到历史最小值且单调不增，`rtt < bestRtt * 0.9` 几乎不可能再成立，
+ * 估计就永久停在上一段连接上。挥拍时刻因此被换算到几万毫秒之外，±150ms 的
+ * 击球窗口一条都匹配不上——表现是「重连之后每一球都打不到」。见 `reset()` 与
+ * `ingest()` 里的突变重锚。
+ */
+const REANCHOR_MS = 1000;
+
 export class ClockSync {
   /** 球拍端时钟比大屏端快多少毫秒（remote − local） */
   private offset = 0;
@@ -109,16 +120,34 @@ export class ClockSync {
     return this.bestRtt === Infinity ? NaN : this.bestRtt;
   }
 
+  /** 换了一段连接就全部作废，重新等 ping-pong 收敛。 */
+  reset() {
+    this.offset = 0;
+    this.bestRtt = Infinity;
+    this.ready = false;
+  }
+
   ingest(t0: number, t1: number, t2: number, t3: number) {
     // t0 大屏发出（大屏时钟），t1 球拍收到（球拍时钟）
     // t2 球拍回发（球拍时钟），t3 大屏收到（大屏时钟）
     const rtt = t3 - t0 - (t2 - t1);
     if (rtt < 0) return;
-    // 只有明显更优的样本才替换，避免抖动把估计带偏
-    if (!this.ready || rtt < this.bestRtt * 0.9) {
-      this.offset = (t1 - t0 + (t2 - t3)) / 2;
-      this.bestRtt = this.ready ? Math.min(this.bestRtt, rtt) : rtt;
+    const offset = (t1 - t0 + (t2 - t3)) / 2;
+
+    // 时钟基准突变（对端页面重载 / 换了一台手机）：不能再等「更优 RTT」，
+    // 那个门限在收敛后形同锁死。直接重锚，并把 bestRtt 放回本次样本，
+    // 让新会话有机会重新收敛。也作为连接层没来得及调用 reset() 时的兜底。
+    if (!this.ready || Math.abs(offset - this.offset) > REANCHOR_MS) {
+      this.offset = offset;
+      this.bestRtt = rtt;
       this.ready = true;
+      return;
+    }
+
+    // 只有明显更优的样本才替换，避免抖动把估计带偏
+    if (rtt < this.bestRtt * 0.9) {
+      this.offset = offset;
+      this.bestRtt = Math.min(this.bestRtt, rtt);
     }
   }
 

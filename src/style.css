@@ -746,6 +746,16 @@ kbd {
   color: var(--amber);
 }
 
+/* 手机端没有键盘，漂移补偿的现场 A/B 靠点这一项；外观仍按 .rate 走 */
+#drift-toggle {
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+}
+
 #axes {
   width: 100%;
   max-width: 300px;

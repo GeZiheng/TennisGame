@@ -56,7 +56,7 @@ npm run dev          # HTTP，5173，不需要证书
 | `npm run dev:https` | 真机测试用的主命令（HTTPS + 5174 + 自动签证书） |
 | `npm run dev` | 纯本地看画面（HTTP + 5173） |
 | `npm run build` | 类型检查 + 打包 |
-| `npm test` | 核心逻辑单测（87 项，不需要浏览器） |
+| `npm test` | 核心逻辑单测（105 项，不需要浏览器） |
 | `npm run sim` | 端到端模拟：假数据跑完整对拉，验证手感参数 |
 | `npm run verify` | 全套验证：单测 ×3 → sim → build，任一步失败即退出（提交前的快检由 git hook 自动跑） |
 | `npm run cert` | 只重新签证书（局域网 IP 变了时用） |
@@ -462,7 +462,7 @@ x 这一条是精确的，不是凑数：`sweepFace` 的判据是「球心落在
 ## 测试
 
 ```bash
-npm test       # 87 项 / 14 个分组：核心逻辑单测，含视觉纯计算 8 项（分组明细见 docs/testing.md）
+npm test       # 105 项 / 16 个分组：核心逻辑单测，含视觉纯计算 8 项（分组明细见 docs/testing.md）
 npm run sim    # 端到端模拟，五档力度 × 6 个种子
 npm run verify # 全套验证：test ×3 → sim → build；提交前 hook 自动跑快检
 ```

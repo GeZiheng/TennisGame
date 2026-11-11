@@ -1,5 +1,5 @@
 import { ImuTracker, qConj, qMul, qNormalize, IDENTITY, type Quat } from '../core/imu';
-import { qAngle, qYaw, toOutputQuat } from '../core/attitude';
+import { isYawGimbal, qYaw, toOutputQuat, YawDriftObserver, PoseContinuityGate } from '../core/attitude';
 import { MotionSource, DemoSource, type SampleSource } from './sensors';
 import { diagnose, noEventsIssue, isFatal, type EnvFacts, type EnvIssue } from './env';
 import { Link, type LinkState } from '../net/link';
@@ -30,6 +30,7 @@ const connPill = $<HTMLSpanElement>('conn-pill');
 const rateEl = $<HTMLSpanElement>('rate');
 const poseRateEl = $<HTMLSpanElement>('pose-rate');
 const poseSrcEl = $<HTMLSpanElement>('pose-src');
+const driftToggleEl = $<HTMLButtonElement>('drift-toggle');
 const axesEl = $<HTMLCanvasElement>('axes');
 const wBar = $<HTMLElement>('w-bar');
 const wVal = $<HTMLElement>('w-val');
@@ -43,6 +44,29 @@ const R2D = 180 / Math.PI;
 const params = new URLSearchParams(location.search);
 const room = (params.get('room') ?? '').toUpperCase().slice(0, 4);
 const demo = params.has('demo');
+
+/* ---------------- 偏航慢漂补偿 ---------------- */
+
+/**
+ * 默认关：现场点 HUD 上的「漂移」按钮、或手机 URL 加 ?drift=1 才接管输出。
+ * 纯读数始终显示，方便先看清「手机没动时传感器多转了多少度」。
+ */
+const drift = new YawDriftObserver();
+let driftOn = params.get('drift') === '1';
+let gimbal = false;
+
+driftToggleEl.addEventListener('click', () => {
+  if (driftOn) {
+    // 开 → 关：把已经扣掉的补偿固化进 yawZero，否则关掉这一刻拍子会突然歪回去。
+    // 这只是数值平移，不是「按当前姿态重新定义正前方」，所以仍然与握位无关。
+    if (yawZero !== null) yawZero += drift.radians;
+  }
+  driftOn = !driftOn;
+  // 关 → 开也要清观测：之前累积的是没被补偿的漂移，一次性扣进去会跳一下
+  drift.reset();
+  driftToggleEl.textContent = driftOn ? '漂移补偿已开' : '漂移补偿已关';
+  driftToggleEl.className = `rate ${driftOn ? 'good' : ''}`;
+});
 
 const source: SampleSource = demo ? new DemoSource() : new MotionSource();
 const tracker = new ImuTracker();
@@ -58,19 +82,15 @@ let yawZero: number | null = null;
 /* ---------------- 姿态连续性 ---------------- */
 
 /**
- * 一次挥拍中段角速度可达 20 rad/s；方向事件 25–35Hz 下相邻两帧最多约 0.8 rad。
- * 超过 1.2 rad（≈69°）就不是真实旋转，而是 deviceorientation 在万向锁附近
- * 换了欧拉角的解分支——采信它会让整只拍子翻过去，并且停在新分支上，
- * 表现就是「挥几次之后拍子和手机差很多」。
+ * 判据与计时都在 `core/attitude.ts` 的 `PoseContinuityGate`（纯计算、有单测）。
+ * 这里只负责传入「传感器此刻是不是在动」和外推所需的陀螺增量。
+ *
+ * 方向事件 20–25Hz 时，20–35 rad/s 的挥拍相邻帧转角可达 1.0–1.75 rad，会越过
+ * 1.2 rad 的固定门限；只看角度会把整段真实挥拍判成解分支跳变，踢进陀螺外推。
  */
-const MAX_POSE_JUMP = 1.2;
-/** 连续外推超过这么久就重新接受绝对姿态：玩家可能真的转过去了。 */
-const MAX_EXTRAP_MS = 500;
-
-let lastGoodAbs: Quat | null = null;    // 上一次被接受的绝对姿态
+const poseGate = new PoseContinuityGate();
 let extrapBase: Quat | null = null;     // 外推基准（最后一次可信输出）
 let trackerAtBase: Quat | null = null; // 那一刻的陀螺积分快照
-let extrapMs = 0;
 let poseMode: 'absolute' | 'extrap' | 'gyro' = 'gyro';
 let currentQ: Quat = [...IDENTITY];
 let lastPoseAt = 0;
@@ -226,34 +246,43 @@ function advancePose(dtMs: number) {
   // 避免外推计时被走两遍。
   const at = performance.now();
   if (at - lastPoseAt < 4) return;
+  // 外推计时必须用真实墙钟间隔：这个函数有两个入口（传感器回调 + 60Hz 发包），
+  // 传进来的 dtMs 一个是真实采样间隔、一个是写死的 16.7，双入口会把 500ms
+  // 兜底提前到约 250ms。
+  const elapsed = lastPoseAt > 0 ? at - lastPoseAt : dtMs;
   lastPoseAt = at;
 
   const abs = source.latestAbs ?? null;
   const fresh = source.hasAbsolute === true;
   if (abs && yawZero === null) yawZero = qYaw(abs);
-  const raw = abs && fresh && yawZero !== null ? toOutputQuat(abs, yawZero) : null;
+
+  if (abs && fresh) {
+    gimbal = isYawGimbal(abs);
+    drift.update(abs);
+  }
+
+  // 只扣「传感器多转的量」，不重新定义正前方，因此与正手 / 反手握位无关。
+  const effZero = (yawZero ?? 0) + (driftOn ? drift.radians : 0);
+  const raw = abs && fresh && yawZero !== null ? toOutputQuat(abs, effZero) : null;
 
   if (raw) {
-    const jump = lastGoodAbs ? qAngle(raw, lastGoodAbs) : 0;
-    const tooLong = extrapMs > MAX_EXTRAP_MS;
-    if (!lastGoodAbs || jump <= MAX_POSE_JUMP || tooLong) {
-      lastGoodAbs = raw;
+    // 传感器说在动，就把大转角认作真实挥拍、直接采信绝对姿态。
+    // 解分支跳变一般出现在静止 / 微动时，那时 moving 为 false，仍会被门拦下。
+    const moving = Math.hypot(lastGyro[0], lastGyro[1], lastGyro[2]) > SWING_THRESHOLD;
+    if (poseGate.decide(raw, elapsed, moving)) {
       extrapBase = raw;
       trackerAtBase = tracker.snapshot();
-      extrapMs = 0;
       poseMode = 'absolute';
       currentQ = raw;
       return;
     }
     // 单帧跳变：这一帧的绝对姿态不可信，继续沿陀螺增量走
     poseMode = 'extrap';
-    extrapMs += dtMs;
     currentQ = extrapolate();
     return;
   }
 
   poseMode = extrapBase ? 'extrap' : 'gyro';
-  extrapMs += dtMs;
   currentQ = extrapolate();
 }
 
@@ -352,6 +381,11 @@ function startUiLoop() {
     const label = poseMode === 'extrap' ? '姿态外推' : poseMode === 'gyro' ? '陀螺仪' : '绝对姿态';
     poseSrcEl.textContent = label;
     poseSrcEl.className = `rate ${poseMode === 'absolute' ? 'good' : 'warn'}`;
+
+    const d = drift.degrees;
+    driftToggleEl.textContent =
+      `漂移 ${d >= 0 ? '+' : ''}${d.toFixed(1)}°${driftOn ? ' · 补偿开' : ''}${gimbal ? ' · 万向锁' : ''}`;
+    driftToggleEl.className = `rate ${driftOn ? 'good' : Math.abs(d) > 20 ? 'warn' : ''}`;
   }, 1000);
 }
 
@@ -480,6 +514,8 @@ async function begin() {
   origin = tracker.snapshot();
   // 重新锁一次朝向基准：这一刻手机指向哪，球拍就认为那是「正前方」
   yawZero = null;
+  drift.reset();
+  poseGate.reset();
 
   gate.hidden = true;
   running.hidden = false;
@@ -498,12 +534,19 @@ async function begin() {
     onCtrl: (msg: CtrlMsg) => {
       if (msg.t === 'recal') {
         origin = tracker.snapshot();
-        yawZero = null; // 把当前朝向重新当作正前方
+        // 补偿开启时，R 只清观测到的漂移量。重锁 yawZero 会把「当前朝向」重新
+        // 定义成正前方，真机确认这只在反手位回得正、正手位会锁错方向。
+        if (driftOn) {
+          // 同样要先固化再清观测：直接 reset 会让拍子瞬间歪回累积的漂移量
+          if (yawZero !== null) yawZero += drift.radians;
+          drift.reset();
+        } else {
+          yawZero = null;
+        }
         // 清掉连续性状态，下一帧直接以当前绝对姿态为新的可信基准
-        lastGoodAbs = null;
+        poseGate.reset();
         extrapBase = null;
         trackerAtBase = null;
-        extrapMs = 0;
         link?.sendCtrl({ t: 'recal-ack', at: performance.now() });
       } else if (msg.t === 'ping') {
         // 必须回 pong，否则大屏那边的时钟同步永远收敛不了：
