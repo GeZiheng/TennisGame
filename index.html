@@ -29,11 +29,11 @@
 
     <div id="game-hud" class="game-hud" hidden>
       <div class="g-streak">
-        <span class="g-label">连拍</span>
+        <span class="g-label" id="s-label">连拍</span>
         <span id="s-streak" class="g-num">0</span>
       </div>
       <div class="g-sub">
-        <span>最好 <b id="s-best">0</b></span>
+        <span><span id="s-sub-label">最好</span> <b id="s-best">0</b></span>
         <span class="g-dot">·</span>
         <span><b id="s-speed">—</b><em>km/h</em></span>
         <span class="g-dot">·</span>
@@ -89,8 +89,8 @@
     </div>
 
     <div class="hint-bar">
-      <kbd>WASD</kbd> 走位 · <kbd>拖动</kbd> 环视 · <kbd>M</kbd> 模拟控制器 · <kbd>X</kbd> 声音 ·
-      <kbd>C</kbd> 重新开始 · <kbd>R</kbd> 重置统计 · <kbd>V</kbd> 视觉 / 键盘对照
+      <kbd>WASD</kbd> 手动走位 · <kbd>F</kbd> 自动走位 · <kbd>拖动</kbd> 环视 · <kbd>M</kbd> 模拟控制器 ·
+      <kbd>X</kbd> 声音 · <kbd>C</kbd> 重新开始 · <kbd>R</kbd> 重置统计 · <kbd>V</kbd> 视觉 / 键盘对照
     </div>
 
     <script type="module" src="/src/play/main.ts"></script>

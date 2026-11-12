@@ -12,6 +12,8 @@ import {
   SERVICE_Z,
   WALL_Z,
   WALL_H,
+  OPP_BASELINE_Z,
+  OPP_HIT_Z,
   BALL_RENDER_R,
   HIT_Z,
   FACE_CY,
@@ -33,6 +35,21 @@ interface Fx {
 
 const TRAIL_LEN = 20;
 const TMP_AXIS = new THREE.Vector3();
+
+/**
+ * 场景模式。
+ *
+ * `wall` = 对墙打（默认，一行没改）：只有半场 + 对面的练习墙。
+ * `duel` = 与脚本回球机对打：整场镜像出来、没有墙、多一支对手球拍。
+ *
+ * 为什么不用一个 `showWall` 布尔：两种模式的**相机、雾、场地线条、可交互对象**
+ * 全都不同，写成布尔会在十几个地方散落 `if`。这里只有一处分支，其余靠字段。
+ */
+export type SceneMode = 'wall' | 'duel';
+
+export interface SceneOptions {
+  mode?: SceneMode;
+}
 
 export class PlayScene {
   readonly renderer: THREE.WebGLRenderer;
@@ -69,7 +86,14 @@ export class PlayScene {
   private glow = 0;
   private ballSpin: V3 = [0, 0, 0];
 
-  constructor(canvas: HTMLCanvasElement) {
+  readonly mode: SceneMode;
+  /** 对手的球拍。`wall` 模式恒为 null。 */
+  private oppRacket: THREE.Group | null = null;
+
+  constructor(canvas: HTMLCanvasElement, opts: SceneOptions = {}) {
+    this.mode = opts.mode ?? 'wall';
+    const duel = this.mode === 'duel';
+
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
     this.renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     this.renderer.shadowMap.enabled = true;
@@ -77,17 +101,20 @@ export class PlayScene {
 
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color('#f7f7f5');
-    this.scene.fog = new THREE.Fog('#f7f7f5', 14, 34);
+    // 对打的场地是墙打的四倍长，雾的远端必须往后推，否则对手整支拍子被雾吃掉。
+    this.scene.fog = duel ? new THREE.Fog('#f7f7f5', 22, 70) : new THREE.Fog('#f7f7f5', 14, 34);
 
     this.camera = new THREE.PerspectiveCamera(50, 1, 0.05, 120);
-    this.camera.position.set(2.0, 2.3, 3.4);
+    // 对打要一眼看到两侧底线：相机抬高、后退，视点压到球网附近。
+    if (duel) this.camera.position.set(0, 4.2, 7.2);
+    else this.camera.position.set(2.0, 2.3, 3.4);
 
     this.controls = new OrbitControls(this.camera, canvas);
-    this.controls.target.set(0, 1.0, -3.6);
+    this.controls.target.set(0, duel ? 0.9 : 1.0, duel ? NET_Z : -3.6);
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.08;
     this.controls.minDistance = 1.5;
-    this.controls.maxDistance = 9;
+    this.controls.maxDistance = duel ? 32 : 9;
     this.controls.maxPolarAngle = Math.PI * 0.495;
     this.controls.update();
 
@@ -99,17 +126,18 @@ export class PlayScene {
     key.shadow.mapSize.set(1024, 1024);
     key.shadow.camera.near = 0.5;
     key.shadow.camera.far = 16;
-    key.shadow.camera.left = -3;
-    key.shadow.camera.right = 3;
-    key.shadow.camera.top = 3;
-    key.shadow.camera.bottom = -3;
+    key.shadow.camera.left = duel ? -14 : -3;
+    key.shadow.camera.right = duel ? 14 : 3;
+    key.shadow.camera.top = duel ? 14 : 3;
+    key.shadow.camera.bottom = duel ? -14 : -3;
     key.shadow.bias = -0.0008;
     // 球拍本来就悬在半空（它是一支虚拟球拍），阴影太重会看着像地上还有一支
     (key.shadow as any).intensity = 0.4;
     this.scene.add(key);
 
     this.buildGround();
-    this.buildWall();
+    if (duel) this.buildOpponent();
+    else this.buildWall();
     this.buildHitZone();
 
     this.racket = new THREE.Group();
@@ -177,12 +205,22 @@ export class PlayScene {
     };
 
     const W = HALF_WIDTH;
+    const duel = this.mode === 'duel';
+    // 对打：边线一直拉到对面底线，其余线条按球网镜像一份。
+    const zFar = duel ? OPP_BASELINE_Z : NET_Z;
+    const svc = duel ? 2 * NET_Z - SERVICE_Z : SERVICE_Z;
     seg(-W, BASELINE_Z, W, BASELINE_Z, 0.08); // 底线
-    seg(-W, BASELINE_Z, -W, NET_Z); // 单打边线
-    seg(W, BASELINE_Z, W, NET_Z);
+    seg(-W, BASELINE_Z, -W, zFar); // 单打边线
+    seg(W, BASELINE_Z, W, zFar);
     seg(-W, SERVICE_Z, W, SERVICE_Z, 0.05); // 发球线
     seg(0, SERVICE_Z, 0, NET_Z, 0.05); // 中央发球线
     seg(-0.16, BASELINE_Z, 0.16, BASELINE_Z, 0.09); // 中点标记
+    if (duel) {
+      seg(-W, OPP_BASELINE_Z, W, OPP_BASELINE_Z, 0.08);
+      seg(-W, svc, W, svc, 0.05);
+      seg(0, svc, 0, NET_Z, 0.05);
+      seg(-0.16, OPP_BASELINE_Z, 0.16, OPP_BASELINE_Z, 0.09);
+    }
 
     // 网：用程序生成的网格纹理，比一块半透明色块更像网
     const c = document.createElement('canvas');
@@ -234,6 +272,41 @@ export class PlayScene {
       post.position.set(px, 0.535, NET_Z);
       post.castShadow = true;
       this.scene.add(post);
+    }
+  }
+
+  /**
+   * 对打模式下的对手（脚本回球机）。
+   *
+   * 只用程序化球拍，不加载 glb：那支模型是给玩家手里那支用的，对手在 20 米外，
+   * 细节全被雾和透视吃掉，多加载一份只会多一次可能失败的请求。
+   *
+   * 位姿每帧从 `Duel.machinePose()` 抄过来，和判定用的是**同一个** `RacketPose`
+   * ——否则又是一次「看着碰到了没打到」。
+   */
+  private buildOpponent() {
+    const g = new THREE.Group();
+    g.position.set(0, 1.0, OPP_HIT_Z);
+    g.add(this.buildRacket());
+    this.scene.add(g);
+    this.oppRacket = g;
+
+    const glow = new THREE.PointLight('#9ec7ff', 0.9, 4.5);
+    glow.position.set(0, 1.6, OPP_HIT_Z);
+    this.scene.add(glow);
+    this.oppGlow = glow;
+  }
+
+  private oppGlow: THREE.PointLight | null = null;
+
+  /** 抄一份对手位姿给渲染。每帧调用，参数就是判定层用的那份 pose。 */
+  syncOpponent(pose: RacketPose) {
+    const g = this.oppRacket;
+    if (!g) return;
+    g.position.set(pose.pos[0], pose.pos[1], pose.pos[2]);
+    g.quaternion.set(pose.q[0], pose.q[1], pose.q[2], pose.q[3]);
+    if (this.oppGlow) {
+      this.oppGlow.position.set(pose.pos[0], pose.pos[1] + FACE_CY, pose.pos[2]);
     }
   }
 

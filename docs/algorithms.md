@@ -24,7 +24,7 @@ src/play/            大屏端：scene（three.js + glb 球拍）、audio、stat
 src/controller/      手机端：sensors（双通道角速度）、env（环境自检）、main（发送循环）
 server/              Vite 插件 + 信令房间 + /__lanip + /ca.crt
 scripts/             证书、单测跑手、端到端模拟、probe-* 诊断工具
-tests/core.test.cjs  105 项 / 16 分组（见 docs/testing.md）
+tests/core.test.cjs  132 项 / 20 分组（见 docs/testing.md）
 ```
 
 ---
@@ -174,7 +174,7 @@ back ∈ [FEED_APEX_BACK_MIN 0.55, FEED_APEX_BACK_MAX 0.85]
 → 落点 1.55–1.85m
 ```
 
-`FEED_APEX_LEAD = 2.40` 是实测值（抛体运动决定：弹起水平速度 3.5–5.0 m/s × 爬升到 1.6m 的 0.5–0.6s ≈ 2.3–2.45m）。**偏 0.1m，顶点就整体前后移 0.1m**，别凭直觉估，改完用 `probe-feed-scan2.cjs` 重测。
+`FEED_APEX_LEAD = 2.40` 是实测值（抛体运动决定：弹起水平速度 3.5–5.0 m/s × 爬升到 1.6m 的 0.5–0.6s ≈ 2.3–2.45m；握点抬到 1.3 后参考握法的到面高度是 1.9m，真实 lead 约 2.5m —— 按 2.4 算会让顶点比设计值更靠近拍面 0.1m，球到面时上升速度从 1.3–1.7 变成 1.7–2.0，方向是安全的，`probe-feed` 实测到面 vy≈1.9）。**偏 0.1m，顶点就整体前后移 0.1m**，别凭直觉估，改完用 `probe-feed-scan2.cjs` 重测。
 
 每球抽一次顶点偏移（`Rally.aimDx/aimDy`）：
 
@@ -268,7 +268,7 @@ dead --(1.3s)--> incoming --(球碰到拍面)--> contact --(挥拍事件)--> out
 ## 3.9 主循环顺序（不能换）
 
 ```ts
-updatePlayer(dt);                              // WASD 走位
+updatePlayer(dt);                              // 自动走位 / 键盘 / 视觉（三选一）
 lastPose = scene.syncRacket(now, dt);          // 先平滑球拍并取位姿
 rally.pushRacket(lastPose);                    // 每一帧都要推
 for (const e of rally.update(dt, now)) handle(e);
@@ -277,6 +277,44 @@ scene.render(dt);
 ```
 
 先判定再平滑 → 拿到的是上一帧姿态，快速挥拍会偏几十度，越用力越容易空。
+
+### `updatePlayer` 里的三路走位
+
+`src/core/auto-move.ts` 只有三个纯函数（`planAutoMove` / `stepAxis` / `blendCenterOffset`），
+决策全在它里面，`app.ts` 只负责调用：
+
+1. **视觉**（`?vision=1`）——摄像头给 `PLAYER.x`，优先级最高，它一接管就 `return`。
+2. **键盘**（`WASD`）——这一帧只要有方向键按下，就整帧走键盘，自动走位让位。
+3. **自动**（默认）——`planAutoMove(ball, { x, z, center })` 给出握点目标 `(x, z)`。
+
+自动那一路的四步（11-13 从一维改成二维）：
+
+1. `sampleCrossings(ball, minZ + c.z, maxZ + c.z)` 沿弹道每 10cm 采一个穿面点；
+2. 每个点换成握点 `(p.x - c.x, p.z - c.z)`，横向超出站位范围就钳位并按半价计惩罚
+   ——球飘到边线外时还是要尽量靠近，不能干脆不追；
+3. 分轴估走到那儿要多久（横移 4.8 / 后退 3.6 m/s），超过球到面时间就淘汰；
+4. 剩下的按 `|球高 - 拍面中心高|` 排序，加 `0.06×耗时` 的微弱惩罚让目标在两帧之间连续
+   （否则会在两个几乎等高的平面之间来回跳，人原地抖）。
+
+一个都来不及的时候**不回到中线**，挑「最赶得上」的那个继续追：球已经发出去，站着看它
+落地是更差的选择。
+
+四个设计点值得记住：
+
+- **目标是拍面中心，不是握点。** 中心挂在握点沿拍柄 0.6m 处（`pos + R(q)·(0, FACE_CY, 0)`）。
+  握法一横，中心就在握点侧方半米，而判定半轴只有 0.24m —— 只把握点对准球，横握时永远打空
+  （实测命中率 0/12）。所以 `c` 必须参与运算，`x` 与 `z` 都是 `p - c`。
+- **`c` 只在不挥拍的帧估计**（`blendCenterOffset`，角速度 > 0.6 rad/s 的帧整帧拒绝，τ=0.4s）。
+  挥拍中段中心会被甩出 0.3–1.1m，采进来就是「一挥拍人被拽着跑」——那是 4.5 已经解决过的
+  老问题，不能从走位这条路径再引回来。
+- **预测和回球机共用 `physics` 里的弹道工具**。`predictAtPlane` 给单平面，`sampleCrossings`
+  给区间曲线；两边不一致会出现「机器算的点对得上、人算的差半米」。
+- **`stepAxis` 是「有多少走多少、到点就停」，不是指数收敛**。指数收敛永远差最后一点点，
+  球到面时还差 10cm 就擦框。
+
+纵深范围 `minZ = HIT_Z - 0.55`（离网 6.8m）、`maxZ = HIT_Z + 2.0`（底线外 0.8m）。后端比
+原来的 +1.35 刻意更深：握点 1.0m 时横握中心只有 1.0m，要靠后退等球掉下来，+1.35 退到头球
+还在 1.15m，永远差半根拍面。
 
 ## 3.10 网络与时钟
 

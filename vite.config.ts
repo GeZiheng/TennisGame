@@ -1,16 +1,4 @@
-import { defineConfig } from 'vite';
-import { lanDev } from './server/vite-plugin.ts';
+import { tennisConfig } from './vite.config.shared.ts';
 
-export default defineConfig({
-  plugins: [lanDev()],
-  server: { host: true, port: 5173 },
-  build: {
-    target: 'es2022',
-    rollupOptions: {
-      input: {
-        play: 'index.html',
-        controller: 'controller.html',
-      },
-    },
-  },
-});
+/** 对墙打（默认）。启动：npm run dev → :5173 */
+export default tennisConfig({ port: 5173, https: false });

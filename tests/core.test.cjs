@@ -8,9 +8,12 @@ const { LatencyWindow, ClockSync, PacketStats } = require('./play/stats.js');
 const { VISION_DEFAULTS, rgbToHsv, hueDistance, hsvHit, buildMask, largestBlob, detect, mapPixelX, lowPass } = require('./play/vision-math.js');
 const { SwingDetector, shotFromStroke } = require('./core/swing.js');
 const { omegaFromQuatDelta } = require('./core/gyro.js');
-const { makeBall, advance, liftOverNet } = require('./core/physics.js');
+const { makeBall, advance, liftOverNet, aimIntoCourt, setWallActive, predictAtPlane, sampleCrossings } = require('./core/physics.js');
+const { planAutoMove, stepAxis, blendCenterOffset, AUTO_MOVE_DEFAULTS } = require('./core/auto-move.js');
 const { Rally } = require('./core/rally.js');
-const { BALL_R, WALL_Z, WALL_H, HIT_Z, RACKET_POS, FACE_RX, FACE_RY, FACE_CY, NET_Z, FEED_APEX_DX, FEED_APEX_DY, FEED_APEX_BACK_MIN, FEED_APEX_BACK_MAX } = require('./core/court.js');
+const { BallMachine, MACHINE_L2, ARRIVE_Y_MIN, ARRIVE_Y_MAX } = require('./core/machine.js');
+const { Duel } = require('./core/duel.js');
+const { BALL_R, WALL_Z, WALL_H, HIT_Z, RACKET_POS, FACE_RX, FACE_RY, FACE_CY, NET_Z, NET_H, HALF_WIDTH, PHYS_DT, OPP_HIT_Z, OPP_BASELINE_Z, FEED_APEX_DX, FEED_APEX_DY, FEED_APEX_BACK_MIN, FEED_APEX_BACK_MAX } = require('./core/court.js');
 const { sweepFace, faceCovers, faceCenter, RacketTrack, IDLE_POSE } = require('./core/racket.js');
 
 let pass = 0;
@@ -886,7 +889,8 @@ t('补偿瞄的是拍面本身：倾斜拍面下不会选出从拍沿下面掠�
   const half = (theta * Math.PI) / 360;
   const pose = { t: 0, pos: [0.35, RACKET_POS[1], HIT_Z], q: [0, Math.cos(half), Math.sin(half), 0] };
   const face = faceCenter(pose);
-  const at = [0.35, 1.59, 0.49];
+  // 触球点贴在拍面中心下方 1cm —— 跟握点高度无关（原来写死 1.59，那是握点 1.0 时的拍面）。
+  const at = [0.35, face[1] - 0.01, 0.49];
   const v = [0, 6.16, -15.65];
   const spin = [-25.6, 0, 0];
 
@@ -905,14 +909,21 @@ t('补偿瞄的是拍面本身：倾斜拍面下不会选出从拍沿下面掠�
   assert.ok(legacy[1] > 12, `旧判据应当选中高吊（这正是被修复的 bug），实际 ${legacy[1].toFixed(2)}`);
 });
 
-t('回球补偿：竖直握拍时盘形判定和窗口判定给出同样能打的结果', () => {
-  // 拍面水平（q=identity）时盘是正的，两个判据都该选出能打的弧线。
+t('回球补偿：竖直拍面下盘形判定和窗口判定给出同样能打的结果', () => {
   // 这条钉住「传了 pose 不会把本来能打的球改坏」。
-  const pose = { t: 0, pos: [0, RACKET_POS[1], HIT_Z], q: [0, 0, 0, 1] };
+  //
+  // 位姿按 `Rally.launch` 的规矩**归一化**：回球目标是 `aimY`（= 触球高度），
+  // 位姿平移到「拍面中心正好落在 aimY」，朝向照旧。所以这里不能拿 `RACKET_POS`
+  // 那个真实握点当位姿——那样拍面中心在 1.9m，而球是从 1.0m 出手的，等于要求
+  // 一条「从腰高爬回头顶」的弧线，撞墙高度必然超 5.2m（实测 5.9m）。
+  const at = [0, 1.0, HIT_Z];
+  const aimY = at[1];
+  const pose = { t: 0, pos: [at[0], aimY - FACE_CY, HIT_Z], q: [0, 0, 0, 1] };
   const face = faceCenter(pose);
+  assert.ok(Math.abs(face[1] - aimY) < 1e-9 && Math.abs(face[2] - HIT_Z) < 1e-9, '归一化位姿不对');
   for (const sp of [20, 26, 32]) {
-    const out = liftOverNet([0, 0.9, HIT_Z], [0, 0, -sp], [0, 0, 0], face[2], face[1], pose);
-    const tr = traceReturn([0, 0.9, HIT_Z], out, [0, 0, 0], pose);
+    const out = liftOverNet(at, [0, 0, -sp], [0, 0, 0], face[2], face[1], pose);
+    const tr = traceReturn(at, out, [0, 0, 0], pose);
     assert.ok(tr.hit, `${sp} m/s 的回球应穿过拍面`);
     assert.ok(tr.wallY !== null && tr.wallY <= WALL_H, `${sp} m/s 撞墙高度应 ≤ ${WALL_H}m`);
   }
@@ -1650,6 +1661,437 @@ t('lowPass 单调收敛、不过冲，退化参数直通', () => {
   assert.ok(x > 0.99, `40 步后应该基本收敛，实际 ${x}`);
   assert.strictEqual(lowPass(0, 1, 16, 0), 1, 'tau=0 表示不平滑');
   assert.strictEqual(lowPass(0.4, 1, 0, 250), 0.4, 'dt=0 时保持');
+});
+
+/* ================= 对打（脚本回球机 + 判分） =================
+ *
+ * 这一整节都跑在「练习墙关掉」的前提下：球从对手底线附近起飞，而练习墙就在
+ * WALL_Z=-11.9，墙一开，球出生那一刻就被抓回墙前（探针没关墙，得出一整族
+ * 错误的调参结论，见 docs/history.md 4.16）。放在文件最后是因为 wallActive
+ * 是模块级开关，`new Duel()` 也会关掉它，跑在前面会污染墙打那批用例。
+ */
+setWallActive(false);
+
+/**
+ * 复算一条弹道，给出过网高度、到面高度、第一落点。
+ *
+ * 判定层的 `shootToLand` 没有导出，这里用 `advance` 的子步回调自己插值——
+ * 顺便保证断言看的是**真实物理**，而不是求解器自己算的那份中间量。
+ */
+function flightOf(from, v, spin) {
+  const b = makeBall(from, [...v], [...spin]);
+  let netY = null;
+  let planeY = null;
+  let land = null;
+  const st = { netted: false };
+  for (let i = 0; i < 240 * 8 && b.live; i++) {
+    advance(
+      b,
+      PHYS_DT,
+      (c) => {
+        if (c.kind === 'net') st.netted = true;
+        if (c.kind === 'ground' && !land) land = [c.at[0], c.at[2]];
+      },
+      (p0, p1) => {
+        const cross = (plane) => {
+          if (p1[2] === p0[2]) return null;
+          if ((p0[2] - plane) * (p1[2] - plane) > 0) return null;
+          return p0[1] + ((p1[1] - p0[1]) * (plane - p0[2])) / (p1[2] - p0[2]);
+        };
+        if (netY === null) netY = cross(NET_Z);
+        if (planeY === null) planeY = cross(HIT_Z);
+      }
+    );
+  }
+  return { netY, planeY, land, netted: st.netted };
+}
+
+/** 回球机的真实出球条件（和 machine.ts 的 aimOpts 一致） */
+const DUEL_FROM = [0, 1.15, OPP_HIT_Z];
+const DUEL_SPIN = [-90, 0, 0];
+const DUEL_AIM = {
+  maxClear: 2.8,
+  speed: [8, 26],
+  arriveZ: HIT_Z,
+  arriveY: [ARRIVE_Y_MIN, ARRIVE_Y_MAX],
+  arriveTol: 0.12,
+};
+
+console.log('自动走位（把玩家搬到球会经过的位置）');
+
+/**
+ * 站位状态 + 握法偏移。`center` 是拍面中心相对握点的偏移（世界系），长度 0.6。
+ * 竖握 = 拍柄朝上，中心在握点正上方；横握 = 拍柄朝侧，中心在握点侧方。
+ */
+const VERT = (x = 0, z = HIT_Z) => ({ x, z, center: [0, FACE_CY, 0] });
+const HORIZ = (x = 0, z = HIT_Z) => ({ x, z, center: [FACE_CY, 0, 0] });
+
+/** 一条真实的回球机来球（和 duel-sim 用同一组求解条件）。 */
+const duelShot = (arriveY) => {
+  const from = [0, 1.15, OPP_HIT_Z];
+  const v = aimIntoCourt(from, [0, BALL_R, -4], [-90, 0, 0], { ...DUEL_AIM, arriveY });
+  assert.ok(v, `arriveY ${arriveY} 应该解得出来`);
+  return makeBall(from, v, [-90, 0, 0]);
+};
+
+t('朝我飞来的球 → 握点目标让拍面中心落在球的弹道上', () => {
+  const b = duelShot([1.4, 1.45]);
+  const plan = planAutoMove(b, VERT());
+  assert.equal(plan.chasing, true);
+  assert.ok(plan.eta > 0.5, `应该给出到面剩余时间，实际 ${plan.eta}`);
+  // 竖握时中心在握点正上方，所以握点 x 就该等于球在那个平面的 x
+  const at = predictAtPlane(b, plan.targetZ);
+  assert.ok(at, '目标平面应该在弹道上');
+  assert.ok(Math.abs(plan.target - at.x) < 0.06, `握点 x ${plan.target.toFixed(3)} 应贴合球心 x ${at.x.toFixed(3)}`);
+  assert.ok(plan.targetZ >= AUTO_MOVE_DEFAULTS.minZ && plan.targetZ <= AUTO_MOVE_DEFAULTS.maxZ,
+    `目标 z ${plan.targetZ} 必须落在可站范围里`);
+});
+
+t('弹道采样：10cm 等距、时间递增，且和精确穿面点吻合', () => {
+  const b = duelShot([1.4, 1.45]);
+  const pts = sampleCrossings(b, AUTO_MOVE_DEFAULTS.minZ, AUTO_MOVE_DEFAULTS.maxZ);
+  assert.ok(pts.length >= 15, `1.9m 范围按 10cm 分格应该十几点，实际 ${pts.length}`);
+  for (let i = 1; i < pts.length; i++) {
+    assert.ok(pts[i].t > pts[i - 1].t, `第 ${i} 点时间没递增`);
+    assert.ok(Math.abs(pts[i].z - pts[i - 1].z - 0.1) < 1e-6, `第 ${i} 点网格不均匀`);
+  }
+  // 同一平面，采样插值与精确穿越的时间差最多一个物理帧（1/240s）
+  const mid = pts[Math.floor(pts.length / 2)];
+  const exact = predictAtPlane(b, mid.z);
+  assert.ok(exact, '中间那个平面应该在弹道上');
+  assert.ok(Math.abs(exact.t - mid.t) < 0.02, `时间差 ${Math.abs(exact.t - mid.t).toFixed(3)}s`);
+  assert.ok(Math.abs(exact.y - mid.y) < 0.06, `高度差 ${Math.abs(exact.y - mid.y).toFixed(3)}m`);
+});
+
+t('横握时补偿拍面中心的横向偏移：握点要站到球的侧边半个拍杆', () => {
+  const b = duelShot([1.4, 1.45]);
+  const vert = planAutoMove(b, VERT());
+  const horiz = planAutoMove(b, HORIZ());
+  assert.equal(horiz.chasing, true);
+  // 中心在握点 +x 侧 0.6m，握点就得往 -x 挪同样多，才让**中心**落到球上
+  const at = predictAtPlane(b, horiz.targetZ);
+  assert.ok(Math.abs(horiz.target + FACE_CY - at.x) < 0.06,
+    `握点 ${horiz.target.toFixed(2)} + 0.6 应落在球心 ${at.x.toFixed(2)}`);
+  // 竖握时两者重合：这条对照证明偏移只来自握法，不是别的东西
+  const atV = predictAtPlane(b, vert.targetZ);
+  assert.ok(Math.abs(vert.target - atV.x) < 0.06);
+  assert.ok(Math.abs((horiz.target + FACE_CY) - (vert.target + FACE_CY * 0)) > 0.4 ||
+            Math.abs(horiz.target - vert.target) > 0.4,
+    `横握要少走约 0.6m，实际竖 ${vert.target.toFixed(2)} / 横 ${horiz.target.toFixed(2)}`);
+});
+
+t('前后走位：拍面中心低（横握）时往后退，让球降到拍面高度', () => {
+  const b = duelShot([1.4, 1.45]);
+  const vert = planAutoMove(b, VERT()); // 中心 1.6m，和来球高度基本一致
+  const horiz = planAutoMove(b, HORIZ()); // 中心 1.0m，得等球掉下来
+  assert.ok(horiz.targetZ > vert.targetZ + 0.5,
+    `横握站位 ${horiz.targetZ.toFixed(2)} 应明显比竖握 ${vert.targetZ.toFixed(2)} 靠后`);
+  assert.ok(horiz.hitY < vert.hitY,
+    `横握接到的球应该更低：${horiz.hitY && horiz.hitY.toFixed(2)} vs ${vert.hitY && vert.hitY.toFixed(2)}`);
+  assert.ok(horiz.targetZ <= AUTO_MOVE_DEFAULTS.maxZ + 1e-9, '不能退到场外');
+});
+
+t('不朝我飞就不追：几乎没有前进速度的慢球不当成来球', () => {
+  // 球就在身边横向飘（z 速度 0.4 m/s < 门槛 0.6），预测器照样算得出它穿过
+  // 击球面的点，所以「不追」必须由 z 速度判据负责，不能靠预测器返回 null 兜住。
+  const b = makeBall([1.4, 1.5, HIT_Z - 0.1], [1.2, 0.8, 0.4]);
+  assert.ok(predictAtPlane(b, HIT_Z), '这条慢球也应该能算出穿面点');
+  const plan = planAutoMove(b, VERT());
+  assert.equal(plan.chasing, false, '前进速度低于门槛，不是「朝我来的球」');
+  assert.equal(plan.target, 0);
+  assert.equal(plan.eta, null);
+});
+
+t('不朝我飞就不追：飞向对面的球也不追', () => {
+  const plan = planAutoMove(makeBall([0.6, 1.4, -6], [0.6, 0.4, -4]), VERT());
+  assert.equal(plan.chasing, false);
+  assert.equal(plan.target, 0);
+});
+
+t('已经从我身边过去的球不追（追不上，只会把人拖走）', () => {
+  // 「过去」的判据是球已经越过拍面能覆盖的最深处（maxZ + 中心偏移），
+  // 不是「越过 HIT_Z」——站得靠后时球在 HIT_Z 之后仍然来得及。
+  const behind = makeBall([1.4, 1.2, AUTO_MOVE_DEFAULTS.maxZ + 0.5], [0, 0.2, 5]);
+  assert.equal(planAutoMove(behind, VERT()).chasing, false);
+  // 同样位置但还在可站范围内：必须追
+  const front = makeBall([1.4, 1.2, AUTO_MOVE_DEFAULTS.maxZ - 0.3], [0, 0.2, 5]);
+  assert.equal(planAutoMove(front, VERT()).chasing, true, '还在可及范围内就该追');
+});
+
+t('球已经死了就回中线，不留在原地发呆', () => {
+  const b = makeBall([0, 1.2, -6], [0, 0, 0]);
+  b.live = false;
+  const plan = planAutoMove(b, VERT());
+  assert.equal(plan.chasing, false);
+  assert.equal(plan.target, 0);
+});
+
+t('限速：一帧最多挪 speed×dt，不会瞬移过去', () => {
+  const dt = 1 / 60;
+  const got = stepAxis(3, 0, AUTO_MOVE_DEFAULTS.speed * dt, 0);
+  assert.ok(Math.abs(got - (3 - AUTO_MOVE_DEFAULTS.speed * dt)) < 1e-9, `实际 ${got}`);
+});
+
+t('进了死区就停，不贴着球正下方左右抖', () => {
+  assert.equal(stepAxis(0.03, 0, 0.08, 0.05), 0.03);
+  assert.equal(stepAxis(0.049, 0, 0.08, 0.05), 0.049);
+});
+
+t('一步够得到就正好停在目标上，不越过它', () => {
+  assert.equal(stepAxis(0.2, 0, 0.5, 0), 0);
+  assert.equal(stepAxis(-0.2, 0, 0.5, 0), 0);
+});
+
+t('反向也对称（左跑和右跑一样快）', () => {
+  assert.equal(stepAxis(0, 2, 0.5, 0), 0.5);
+  assert.equal(stepAxis(0, -2, 0.5, 0), -0.5);
+});
+
+t('握法偏移只在没挥拍的帧采信：挥拍中冻结，静止两秒内收敛', () => {
+  const q0 = [0, 0, 0, 1];
+  const off = [0, FACE_CY, 0];
+  // 静止帧：握法从竖握换到横握。τ=0.4s，2 秒 = 5τ，残差 <1%
+  for (let i = 0; i < 120; i++) {
+    assert.equal(blendCenterOffset(q0, q0, 1 / 60, [FACE_CY, 0, 0], off), true);
+  }
+  assert.ok(Math.abs(off[0] - FACE_CY) < 0.02, `x 应该收到 ${FACE_CY}，实际 ${off[0].toFixed(3)}`);
+  assert.ok(Math.abs(off[1]) < 0.02, `y 应该收到 0，实际 ${off[1].toFixed(3)}`);
+  // 挥拍帧：16.7ms 转 0.5rad ≈ 30 rad/s，整帧拒绝——
+  // 挥拍中拍面中心会被甩出 0.3–1.1m，采进来就是「一挥拍人被拽着跑」
+  const qFast = [0, Math.sin(0.25), 0, Math.cos(0.25)];
+  const before = [...off];
+  assert.equal(blendCenterOffset(q0, qFast, 1 / 60, [0, FACE_CY, 0], off), false);
+  assert.deepEqual(off, before, '挥拍中不许改偏移');
+});
+
+t('端到端：中途跑开 2.2m，自动走位仍把球拉回判定位内', () => {
+  // 墙打的球是瞄着「发球那一刻的拍面」来的，落地重瞄只能横移 20cm。
+  // 玩家中途按错方向跑到边上，球就不会来找他了——这是「够不到」的典型现场。
+  setWallActive(true);
+  const realRandom = Math.random;
+  let rs = 20261112;
+  Math.random = () => {
+    rs = (rs * 1103515245 + 12345) % 2147483648;
+    return rs / 2147483648;
+  };
+  try {
+    const r = new Rally();
+    const dt = 1 / 60;
+    let now = 1000;
+    let px = 0;
+    let pz = HIT_Z;
+    const devs = [];
+    for (let i = 0; i < 60 * 32; i++) {
+      now += dt * 1000;
+      if (i === 40) px = 2.2; // 跑开，此后完全交给自动走位
+      const plan = planAutoMove(r.ball, { x: px, z: pz, center: [0, FACE_CY, 0] });
+      const speed = plan.chasing ? AUTO_MOVE_DEFAULTS.speed : AUTO_MOVE_DEFAULTS.homeSpeed;
+      const speedZ = plan.chasing ? AUTO_MOVE_DEFAULTS.speedZ : AUTO_MOVE_DEFAULTS.homeSpeed;
+      px = Math.max(-AUTO_MOVE_DEFAULTS.maxX,
+        Math.min(AUTO_MOVE_DEFAULTS.maxX, stepAxis(px, plan.target, speed * dt, AUTO_MOVE_DEFAULTS.deadband)));
+      pz = Math.max(AUTO_MOVE_DEFAULTS.minZ,
+        Math.min(AUTO_MOVE_DEFAULTS.maxZ, stepAxis(pz, plan.targetZ, speedZ * dt, AUTO_MOVE_DEFAULTS.deadband)));
+      r.pushRacket({ t: now, pos: [px, RACKET_POS[1], pz], q: [0, 0, 0, 1] });
+      // 球穿过**这一帧的**站位平面那一刻，量球心与握点的横向差（竖握 = 与拍面中心的差）
+      const prevZ = r.ball.p[2];
+      const prevPz = pz;
+      r.update(dt, now); // 不挥拍，球擦框掉落，于是会一直重发
+      if ((prevZ - prevPz) * (r.ball.p[2] - prevPz) <= 0 && r.ball.p[2] !== prevZ) {
+        devs.push(Math.abs(r.ball.p[0] - px));
+      }
+    }
+    assert.ok(devs.length >= 6, `32 秒里应该有多次来球，实际 ${devs.length}`);
+    const worst = Math.max(...devs);
+    // 判定半轴 0.203，但喂球本身还有 ±0.12 的顶点散布，留到 0.25 算「进判定位」
+    assert.ok(worst <= 0.25, `最差到面横向偏差 ${worst.toFixed(3)}m，应该 ≤0.25`);
+  } finally {
+    Math.random = realRandom;
+    // 后面的对打用例全部从 OPP_HIT_Z 之后起飞，必须关墙——这里显式还回去，
+    // 别指望「文件里没写过 setWallActive(true) 就等于墙关着」。
+    setWallActive(false);
+  }
+});
+
+console.log('对打 · 求解器的到面高度约束');
+
+t('回球机要的是「弹起来爬到你手上」的球：界内、过网、到面高度在 ARRIVE_Y 带内', () => {
+  const v = aimIntoCourt(DUEL_FROM, [0, BALL_R, -4], DUEL_SPIN, DUEL_AIM);
+  assert.ok(v, '从底线中线打 -4 应该有解');
+  const r = flightOf(DUEL_FROM, v, DUEL_SPIN);
+  assert.ok(!r.netted, '不能撞网');
+  assert.ok(r.netY !== null && r.netY > NET_H, `过网高度必须高于网 ${NET_H}，实际 ${r.netY}`);
+  assert.ok(r.land, '必须落地');
+  assert.ok(Math.abs(r.land[1] + 4) < 0.5, `落点 z 应压在 -4 附近，实际 ${r.land[1].toFixed(2)}`);
+  assert.ok(Math.abs(r.land[0]) < HALF_WIDTH, '落点必须在边线内');
+  assert.ok(r.planeY !== null, '球到面时必须还活着');
+  assert.ok(
+    r.planeY >= ARRIVE_Y_MIN - 0.12 && r.planeY <= ARRIVE_Y_MAX + 0.12,
+    `到面高度 ${r.planeY.toFixed(3)} 超出 ${ARRIVE_Y_MIN}–${ARRIVE_Y_MAX} ±0.12`
+  );
+});
+
+t('到面高度是硬约束：举过头顶、压到脚边都必须判无解', () => {
+  const high = aimIntoCourt(DUEL_FROM, [0, BALL_R, -4], DUEL_SPIN, { ...DUEL_AIM, arriveY: [3.0, 3.5] });
+  assert.strictEqual(high, null, '3 米高的到面高度不可能，必须判无解，不能硬给一条弧线');
+  // 这一条是实测踩出来的：第一版发球只约束落点，到面高度解出来 0.17m，
+  // 而玩家拍面中心永远在握点上方 0.6m，一帧都接不到。
+  const low = aimIntoCourt(DUEL_FROM, [0, BALL_R, -4], DUEL_SPIN, { ...DUEL_AIM, arriveY: [0.15, 0.35] });
+  assert.strictEqual(low, null, '0.2 米高的到面高度（球落到脚边）同样无解');
+});
+
+t('arriveTol 收紧后，解出来的到面高度也跟着收', () => {
+  const v = aimIntoCourt(DUEL_FROM, [0, BALL_R, -4], DUEL_SPIN, {
+    ...DUEL_AIM,
+    arriveY: [1.45, 1.5],
+    arriveTol: 0.02,
+  });
+  assert.ok(v, '1.45–1.5 这一段应该有解');
+  const r = flightOf(DUEL_FROM, v, DUEL_SPIN);
+  const slack = 0.02 + 1e-3; // 过网/落点是按 240Hz 采样判的，留一点数值余量
+  assert.ok(
+    r.planeY >= 1.45 - slack && r.planeY <= 1.5 + slack,
+    `到面高度 ${r.planeY.toFixed(3)} 超出 1.45–1.5 ±0.02`
+  );
+});
+
+console.log('对打 · 回球机');
+
+t('球不再朝它飞时不给预测', () => {
+  const m = new BallMachine(MACHINE_L2);
+  m.beginPlay(0);
+  assert.strictEqual(m.pickIntercept(1000, makeBall([0, 1.2, -15], [0, 0.5, 6])), null, '球在往回飞');
+  assert.strictEqual(m.pickIntercept(1000, makeBall([0, 1.2, -15], [0, 0.5, 0])), null, '只横向漂移也不算');
+});
+
+t('预测点必须落在本方半场、不贴网、也不退出挡板', () => {
+  const m = new BallMachine(MACHINE_L2);
+  m.beginPlay(0);
+  const cases = [
+    [[0.8, 1.2, -15], [0, 1, -8]],
+    [[3.0, 1.0, -20], [1, 2, -9]],
+    [[-2.5, 1.6, -18], [-1, 0.5, -10]],
+  ];
+  for (const [p, v] of cases) {
+    const r = m.pickIntercept(1000, makeBall(p, v));
+    assert.ok(r, `球 ${JSON.stringify(p)} 应该给出预测点`);
+    assert.ok(r.t > 0, 't 必须是从现在算起的正数');
+    assert.ok(Number.isFinite(r.x) && Number.isFinite(r.y), 'x/y 必须是有限数');
+    // Z_NEAR = NET_Z - 1.6、Z_FAR = OPP_BASELINE_Z - 0.8，这里不导常量，只钉住「在本方半场」。
+    assert.ok(r.z < NET_Z - 1.5, `预测点 z=${r.z.toFixed(2)} 太贴网`);
+    assert.ok(r.z > OPP_BASELINE_Z - 0.9, `预测点 z=${r.z.toFixed(2)} 已经退到挡板外`);
+  }
+});
+
+t('同种子出招一致；reset 重播，park 不重播', () => {
+  const draw = (m) => [0, 1, 2].map(() => m.chooseTarget());
+  const a = new BallMachine(MACHINE_L2);
+  const b = new BallMachine(MACHINE_L2);
+  const ref = draw(b);
+  assert.deepStrictEqual(draw(a), ref, '同种子必须给出同一串落点');
+  a.reset();
+  assert.deepStrictEqual(draw(a), ref, 'reset 是「换一局」，必须把随机数拨回种子');
+  a.park();
+  assert.notDeepStrictEqual(draw(a), ref, 'park 是「这一分结束」，不能把随机数拨回种子，否则每分落点一模一样');
+});
+
+t('反应延迟内它不动，反应完才朝球跑', () => {
+  const m = new BallMachine(MACHINE_L2); // reactMs = 300
+  m.beginPlay(0);
+  const ball = makeBall([3.0, 1.0, -20], [0, 2, -9]);
+  for (let i = 0; i < 15; i++) m.update(1 / 60, (i * 1000) / 60, ball); // 250ms，还在延迟里
+  assert.ok(Math.abs(m.pos[0]) < 1e-9, `反应延迟内不该横移，实际 x=${m.pos[0]}`);
+  for (let i = 15; i < 60; i++) m.update(1 / 60, (i * 1000) / 60, ball);
+  assert.ok(m.pos[0] > 0.5, `反应结束后应该朝球那一侧跑，实际 x=${m.pos[0].toFixed(2)}`);
+});
+
+t('Duel 构造时就关掉练习墙（否则从对手底线发的球会被抓回网前）', () => {
+  setWallActive(true);
+  const stuck = makeBall([0, 1.5, -15], [0, 0, -6]);
+  advance(stuck, PHYS_DT, () => {});
+  assert.ok(stuck.p[2] > -12.0, `墙开着时球被挡在网后 1.4 米，实际 z=${stuck.p[2].toFixed(2)}`);
+
+  const d = new Duel();
+  assert.strictEqual(d.score.player, 0, '新开一局比分归零');
+  const free = makeBall([0, 1.5, -15], [0, 0, -6]);
+  advance(free, PHYS_DT, () => {});
+  assert.ok(free.p[2] < -15, `Duel 构造后球应该能自由飞过 WALL_Z，实际 z=${free.p[2].toFixed(2)}`);
+});
+
+console.log('对打 · 判分');
+
+/** 摆一个「玩家刚打完、球飞向对手」的活球局，不经过挥拍直接给判分喂输入 */
+const armedDuel = (bounces) => {
+  const d = new Duel();
+  d.phase = 'live';
+  d.hitter = 'player';
+  d.receiver = 'machine';
+  d.rally = 3;
+  d.bouncesOnReceiver = bounces;
+  return d;
+};
+
+const runFrames = (d, frames = 30) => {
+  const ev = [];
+  for (let i = 0; i < frames; i++) ev.push(...d.update(1 / 60, (i * 1000) / 60));
+  return ev;
+};
+
+t('第一落点定局：界内弹过一次后滚出边线，算对手没接到而不是击球方出界', () => {
+  const d = armedDuel(1);
+  d.ball = makeBall([4.0, 0.6, -6], [26, 0, 0]); // 从边线内侧横向滚出界
+  const ev = runFrames(d);
+  const pt = ev.filter((e) => e.kind === 'point');
+  assert.strictEqual(pt.length, 1, '一分只能结束一次');
+  assert.strictEqual(pt[0].winner, 'player', '球已经合法落在对方场内，这一分归击球方');
+  assert.strictEqual(pt[0].reason, '对手没接到');
+  assert.ok(!ev.some((e) => e.kind === 'out'), '滚出边线不是击球方出界，不能补一条 out 事件');
+});
+
+t('对照：没落地就飞出场外，算击球方出界', () => {
+  const d = armedDuel(0);
+  d.ball = makeBall([4.0, 0.6, -6], [26, 0, 0]);
+  const ev = runFrames(d);
+  const pt = ev.filter((e) => e.kind === 'point');
+  assert.strictEqual(pt.length, 1);
+  assert.strictEqual(pt[0].winner, 'machine');
+  assert.strictEqual(pt[0].reason, '出界');
+});
+
+t('接球方半场弹第二次就判「两次落地」', () => {
+  const d = armedDuel(1);
+  const ev = [];
+  d.onCollision({ kind: 'ground', at: [0.3, BALL_R, -15] }, 100, ev);
+  assert.ok(
+    ev.some((e) => e.kind === 'miss' && e.reason === 'double' && e.by === 'machine'),
+    '要给出「接球方两次落地」的 miss 事件'
+  );
+  const pt = ev.filter((e) => e.kind === 'point');
+  assert.strictEqual(pt[0].winner, 'player');
+  assert.strictEqual(pt[0].reason, '两次落地');
+});
+
+t('第一落点在自己半场判没过网，落对方半场边线外判出界', () => {
+  const a = armedDuel(0);
+  let ev = [];
+  a.onCollision({ kind: 'ground', at: [0, BALL_R, -4] }, 100, ev); // -4 在网这一侧
+  assert.ok(ev.some((e) => e.kind === 'out' && e.by === 'player'), '要给出击球方 out 事件');
+  assert.strictEqual(ev.find((e) => e.kind === 'point').reason, '没过网');
+  assert.strictEqual(ev.find((e) => e.kind === 'point').winner, 'machine');
+
+  const b = armedDuel(0);
+  ev = [];
+  b.onCollision({ kind: 'ground', at: [HALF_WIDTH + 0.4, BALL_R, -15] }, 100, ev);
+  assert.strictEqual(ev.find((e) => e.kind === 'point').reason, '出界');
+  assert.strictEqual(ev.find((e) => e.kind === 'point').winner, 'machine');
+});
+
+t('撞网判下网', () => {
+  const d = armedDuel(0);
+  const ev = [];
+  d.onCollision({ kind: 'net' }, 100, ev);
+  const pt = ev.filter((e) => e.kind === 'point');
+  assert.strictEqual(pt[0].reason, '下网');
+  assert.strictEqual(pt[0].winner, 'machine');
 });
 
 console.log(`\n${pass} 项通过`);

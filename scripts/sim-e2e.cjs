@@ -15,6 +15,19 @@ const { Rally } = require('../.tmp-sim/core/rally.js');
 const { HIT_Z, RACKET_POS } = require('../.tmp-sim/core/court.js');
 const { faceCenter } = require('../.tmp-sim/core/racket.js');
 const { makeBall, advance } = require('../.tmp-sim/core/physics.js');
+const { planAutoMove, stepAxis, AUTO_MOVE_DEFAULTS } = require('../.tmp-sim/core/auto-move.js');
+const { FACE_CY } = require('../.tmp-sim/core/court.js');
+
+/**
+ * 走位方式，由环境变量 `MOVE` 选，默认 `naive`（历史行为，门禁按它判）。
+ *
+ *   naive —— 朝球的**当前**横向位置跑（本文档下面解释为什么不做弹道外推）
+ *   auto  —— 用玩家侧真正上线的那套 `planAutoMove`：预测球穿击球面时的 x，
+ *            限速搬过去，没来球时回中线。和 `src/play/app.ts` 同一份代码。
+ *   off   —— 人站着不动。用来量化「不走到球的落点上，命中率到底是多少」，
+ *            也就是自动走位这个功能存在的理由。
+ */
+const MOVE = process.env.MOVE ?? 'naive';
 
 /**
  * 「球还有多久到拍面」——直接拿物理往前推，而不是按当前速度外推。
@@ -191,8 +204,20 @@ function run({ peakW, label, seed }) {
         hasSwung = false;
       }
 
-      // ---- 2.5 走位：球朝我飞来时，朝预测落点跑 ----
-      if (r.ball.v[2] > 0.5) {
+      // ---- 2.5 走位 ----
+      if (MOVE === 'auto') {
+        // 和 `src/play/app.ts` 同一套决策，但**只吃 x**：这个脚本的挥拍时机是按
+        // 「球到 HIT_Z」算的，站位跟着 z 变会把时机判据一起改掉，A/B 就不可比了。
+        // 竖握（center 朝上）时拍面中心就在握点正上方，x 目标与中心目标一致。
+        const plan = planAutoMove(
+          r.ball,
+          { x: racketX, z: HIT_Z, center: [0, FACE_CY, 0] },
+          AUTO_MOVE_DEFAULTS,
+        );
+        const speed = plan.chasing ? AUTO_MOVE_DEFAULTS.speed : AUTO_MOVE_DEFAULTS.homeSpeed;
+        const next = stepAxis(racketX, plan.target, speed * (dt / 1000), AUTO_MOVE_DEFAULTS.deadband);
+        racketX = Math.max(-3, Math.min(3, next));
+      } else if (MOVE === 'naive' && r.ball.v[2] > 0.5) {
         // 朝球的**当前**横向前进，不做弹道外推：来球还要落地弹一次，
         // 整条弹道外推会把落地那一拐算进去，走位容易追过头。直接朝球走，天然收敛。
         const aim = Math.max(-3, Math.min(3, r.ball.p[0]));
@@ -242,7 +267,7 @@ function run({ peakW, label, seed }) {
   return ok;
 }
 
-console.log('端到端：60Hz 发包 + 30Hz 姿态（平台段输入），每档多个种子\n');
+console.log(`端到端：60Hz 发包 + 30Hz 姿态（平台段输入），走位=${MOVE}，每档多个种子\n`);
 const cases = [
   { peakW: 5.5, label: '轻挥（刚过门槛）' },
   { peakW: 8, label: '中力' },

@@ -6,14 +6,14 @@
 
 ## 8.1 一句话与运行链路
 
-`tests/` 目录下只有 **一个文件**：`tests/core.test.cjs`，1655 行、**105 项**、16 个分组。它没有用 vitest / jest，而是自带一个 10 行的 `t(name, fn)`（`tests/core.test.cjs:14`）+ `node:assert`：每项单独 try/catch，失败打印 `FAIL` 并设 `process.exitCode`，**不中断**，最后打印「N 项通过」。
+`tests/` 目录下只有 **一个文件**：`tests/core.test.cjs`，2089 行、**132 项**、20 个分组。它没有用 vitest / jest，而是自带一个 10 行的 `t(name, fn)`（`tests/core.test.cjs:14`）+ `node:assert`：每项单独 try/catch，失败打印 `FAIL` 并设 `process.exitCode`，**不中断**，最后打印「N 项通过」。
 
 理由写在 `scripts/test.mjs` 开头：`src/core/` 刻意不依赖 three.js 和 DOM，这几块逻辑（二进制协议、姿态积分、分位数、时钟同步）编成 CommonJS 就能在 Node 里直接跑，不必多装一套测试框架。
 
 ```bash
 npm test
 # └─ node scripts/test.mjs
-#    ├─ tsc 把 12 个 .ts 编到 .tmp-test/{core,play}/*.js（--module commonjs --target es2022）
+#    ├─ tsc 把 15 个 .ts 编到 .tmp-test/{core,play}/*.js（--module commonjs --target es2022）
 #    ├─ 写 .tmp-test/package.json = {"type":"commonjs"}（根项目是 ESM，产物必须单独声明）
 #    ├─ 把 tests/core.test.cjs 复制成 .tmp-test/run.cjs
 #    └─ 以 .tmp-test 为 cwd 执行 run.cjs
@@ -22,7 +22,8 @@ npm test
 因此有三件容易踩空的事：
 
 1. 测试里 `require('./core/xxx.js')` 指向的是**编译产物**，不是 `src/`。改完 TS 不重跑 `npm test`，测的还是旧代码。
-2. 编译输入是 `scripts/test.mjs` 里**写死的 12 个文件**（`protocol / imu / attitude / vec / court / gyro / swing / racket / physics / rally` + `play/stats` + `play/vision-math`）。**新增 core 模块必须同时加到 `scripts/test.mjs` 和 `scripts/sim.mjs` 的输入列表**，否则 require 不到；只给单测用的 play 层纯计算模块（如 `vision-math`）加 `test.mjs` 即可，两处列表因此不再逐行相同。
+2. 编译输入是 `scripts/test.mjs` 里**写死的 15 个文件**（`protocol / imu / attitude / vec / court / gyro / swing / racket / physics / rally / machine / duel / auto-move` + `play/stats` + `play/vision-math`）。**新增 core 模块必须加到编译输入列表**，否则 require 不到：墙打那套（`sim.mjs` 也要用）两处都加；只服务对打的 `machine` / `duel` 加 `test.mjs` 就够，端到端由 `scripts/duel-sim.mjs` 自己的 `.tmp-duel` 编译链负责。`auto-move` 两处都加——`sim.mjs` 那边是为了 `MOVE=auto` 的 A/B。只给单测用的 play 层纯计算模块（如 `vision-math`）同样只加 `test.mjs`，两处列表因此不再逐行相同。
+
 3. `test.mjs` 刻意不删 `.tmp-test/` 目录（删除拦截器会挡递归删除，tsc 会覆盖同名产物）。代价是目录里可能留旧文件：**别写成 `require('./court.js')` 漏掉 `/core/`**，那会静默加载过时物理，症状很像物理 bug。同理 `.tmp-sim/` 是 `npm run sim` 的产物，probe 脚本从那里读编译结果。
 
 改动后的固定流程见 `AGENTS.md` 第 3 节：`npm run verify`（`test` ×3 → `sim` → `build`），`git commit` 前由 `scripts/hooks/pre-commit` 跑快检。probe 依赖 `.tmp-sim`，所以必须排在 `sim` 之后。
@@ -31,15 +32,16 @@ npm test
 
 | 层 | 入口 | 跑什么 | 能回答什么 | 覆盖不到的 |
 |---|---|---|---|---|
-| 单测 | `npm test` | 105 项，算子级 + 短场景 | 某个公式、判据、状态机分支对不对 | 整局手感、网络、真机 |
-| 端到端模拟 | `npm run sim` | 五档力度 × 6 随机种子，完整对拉 | 参数改了之后还能不能连打、会不会撞网/漏接 | 传感器、渲染、真机姿态 |
+| 单测 | `npm test` | 132 项，算子级 + 短场景 | 某个公式、判据、状态机分支对不对 | 整局手感、网络、真机 |
+| 端到端模拟 | `npm run sim` | 五档力度 × 6 随机种子，完整对拉；`MOVE=auto|off` 可换走位做 A/B | 参数改了之后还能不能连打、会不会撞网/漏接 | 传感器、渲染、真机姿态 |
+| 对打模拟 | `npm run duel-sim` | 三档难度 × 6 种子 × 60s，玩家侧是求解器 | 回球机能不能连续接球、难度梯度方向对不对 | 玩家侧不是 `shotFromStroke`，见 `docs/duel.md` 第 8 节 |
 | 调参取证 | `scripts/probe-*.cjs` | 扫拍面高度 / 落点 / 转角 / 站位 | 「为什么这个数是这个值」的实测依据 | 不自动判定通过/失败，要人读表 |
 | 信令冒烟 | `npm run test:signal` | 两个 WebSocket 客户端走配对→转发→断线 | 房间配对链路通不通 | 需先 `npm run dev`，**不在 `npm test` 里** |
 | 真机 | 手机 + 大屏 | 现场观察 + HUD 六个数 | 挥拍时球到底回不回弹 | 无自动化，见 7.4 |
 
 **绿 ≠ 修好了。** 本项目吃过「单测全绿、sim 30/30、真机全漏」的亏（模拟器里球拍曾全程不转，见 `docs/tuning.md` 6.3）。真机症状仍是最高优先级未决项，见 `AGENTS.md` 0.3 与 `docs/known-issues.md` 7.1。
 
-## 8.3 16 个分组，逐组说明
+## 8.3 20 个分组，逐组说明
 
 分组由文件里的 `console.log('…')` 标题切分，顺序即执行顺序。
 
@@ -61,6 +63,10 @@ npm test
 | 挥拍时的球拍位姿 | 3 | `core/racket.ts` + `rally.ts` | 转 60° 时拍面中心必须绕握点扫出 0.45m 以上（**反锚定**）、参考握法下中心在握点正上方 `FACE_CY`、球拍持续 ±70° 摆动时仍必须打得中（物理弹道 + 落地重瞄，真机主路径） |
 | 对墙打状态机 | 15 | `core/rally.ts` | 整局：弹地喂球先落一次地、顶点只要求落在拍面附近且有散布、发球后走开必然够不着（飞行途中不改方向的反证）、没挥时擦框掉落而非穿过拍面、一直挥能一直对拉且过网/击球 1:1、站到边上不动也喂得到手、漏接后重新发球、±150ms 时间窗早晚都不算、抢跑与「无抢跑」对照、击球诊断（没挥 / 挥早挥晚 / 挥太后）、拍面 30×38cm 的尺寸反证、走位到位时甜区是「附近」不是每球正中 |
 | 视觉走位（纯计算） | 8 | `play/vision-math.ts` | RGB→HSV 与环形色相距离、低饱和/低明度拒绝、最大连通块质心抗同色噪点、面积门槛、像素质心钳位映射、低通单调不过冲。**只测纯函数，摄像头 / DOM 不在其中** |
+| 自动走位 | 13 | `core/auto-move.ts` + `physics.predictAtPlane` / `sampleCrossings` | 朝我飞时**拍面中心**落到弹道上、**前进速度低于门槛的慢球不当来球**（判据自己做主，不靠预测器返回 null 兜）、已过可及纵深不追、球死了回中线、**横握时握点要站到球的侧边 0.6m**、**拍面中心低时要后退让球降到拍面高度**、弹道采样等距且与精确穿面点吻合、**握法偏移只在没挥拍的帧采信**（挥拍帧冻结）、限速一帧只挪 `speed×dt`、死区内不动、一步够得到就停在目标上不越过、左右对称；**端到端：第 40 帧把玩家瞬移到 x=2.2，之后撒手，自动走位仍把每球拉回判定位内** |
+| 对打 · 求解器的到面高度约束 | 3 | `core/physics.ts`（`aimIntoCourt`） | 解出来的球必须真的界内 + 过网 + 到面落在指定高度带（用 `advance` 复算，不看求解器自己的中间量）、**举过头顶或压到脚边都必须判无解**、`arriveTol` 收紧后解跟着收 |
+| 对打 · 回球机 | 5 | `core/machine.ts` | 球不朝它飞时不给预测（含只横向漂移）、预测点必须在本方半场且不贴网、同种子出招一致 / `reset` 重播 / **`park` 不重播**、反应延迟内不动而延迟后朝球跑、**`Duel` 构造即关掉练习墙** |
+| 对打 · 判分 | 5 | `core/duel.ts` | **第一落点定局**（界内弹过后滚出边线算对手没接到，不补 `out`）+ 对照（没落地就飞出去算出界）、接球方半场弹第二次判两次落地、落回自己半场判没过网 / 落对方半场边线外判出界、撞网判下网 |
 
 分组之外还有一个纯计算 A/B 探针 `scripts/probe-pose.cjs`：复刻修复前「基准冻结」的姿态判据，扫描 10/20/30/40 rad/s 与「挥完回原位 / 停在新朝向」两种序列，输出外推帧数、最长连续外推、姿态源切换次数。**先跑 `npm test` 生成 `.tmp-test` 再执行**；它不覆盖削顶陀螺积分、网络乱序与大屏平滑。
 
@@ -84,10 +90,14 @@ npm test
 | 跳变只拦一帧 | 比较基准冻结在跳变前会让整段挥拍卡在陀螺外推里，直到 500ms 兜底才跳回 | `docs/history.md` 4.14 |
 | 扣掉观测漂移后输出回到启动姿态 | 补偿只能扣「传感器多转的量」，不能重锁 `yawZero`（那会把握位差一并吸进去，只在反手位回得正） | `docs/history.md` 4.13 |
 | 时钟基准突变必须重新锚定 | 只认最优 RTT 的门限在收敛后形同锁死，会把新会话的挥拍时刻算到窗口外 | `docs/history.md` 4.12 |
+| 到面高度够不到时必须判无解 | 玩家拍面中心锁在握点 +0.6m 的球壳上（1.3–1.9m），硬给一条到面 0.17m 的弧线 = 玩家一帧都接不到 | `docs/duel.md` 5.1 |
+| 界内弹过后滚出边线不算击球方出界 | 第一落点定局；否则「对手没接到」会被改判成「击球方出界」，得分反过来给对手 | `docs/history.md` 4.16 |
+| `park` 不能把随机数拨回种子 | 每分落点会一模一样，对手变成复读机；`reset` 才是「换一局」 | `docs/duel.md` 4.2 |
+| `Duel` 构造即关掉练习墙 | 练习墙在网后 1.4 米，墙一开，从对手底线发的球出生就被抓回网前，一球都过不了网 | `docs/duel.md` 3 |
 
 ## 8.5 加新测试的约定
 
-**写法**：`t('现象 → 期望', () => { … })`，名字写清「什么情况下应该怎样」，别只写模块名。断言用 `node:assert`；需要固定序列时用文件里已有的 helper：`flatPose` / `strokeAt` / `placeRacket` / `predictX` / `drive` / `feed` / `qAA` / `quatAxis`。`drive()` 按 60fps 推进并返回各类事件计数，整局场景优先复用它。
+**写法**：`t('现象 → 期望', () => { … })`，名字写清「什么情况下应该怎样」，别只写模块名。断言用 `node:assert`；需要固定序列时用文件里已有的 helper：`flatPose` / `strokeAt` / `placeRacket` / `predictX` / `drive` / `feed` / `qAA` / `quatAxis`，对打那三组用 `flightOf`（复算一条弹道的过网高度 / 到面高度 / 第一落点）与 `armedDuel` + `runFrames`（摆一个活球局再推进若干帧）。`drive()` 按 60fps 推进并返回各类事件计数，整局场景优先复用它。
 
 **时间单位（最容易写错）**：
 
@@ -106,6 +116,10 @@ npm test
 - 样本少的统计断言**不要卡跨度**（4 球的甜区跨度会偶发红），改成「都在盘内 + 不是每球完全一样」。
 - 改发球节奏要**放宽所有「等球到面」的窗口**，否则偶发失败，而且看起来像别的问题。
 
+**模块级开关（对打那组有坑）**：`physics` 的 `wallActive` 是全局的，`new Duel()` 会把它关掉、`shootToLand` 内部临时关又还原。所以：对打用例整体放在文件**最后**，开头显式 `setWallActive(false)`；任何「球在 `WALL_Z` 之后起飞」的弹道（`WALL_Z=-11.9`，对打的发球点在 `-22.05`）不关墙会被抓回网前，症状是一整族数字都长得一样——`docs/history.md` 4.16 记过一次因为没关墙而得出错误调参方向的教训。
+
+**反过来也要还回去**：墙打的用例会 `setWallActive(true)`（自动走位那条端到端就需要墙在），跑完**必须在 `finally` 里设回 `false`**。11-12 加这条时忘了还，紧跟其后的三条对打用例全红，第一反应会以为是回球机坏了。这条坑的形状是「前面的用例改了全局状态、后面的用例隔着十几个分组才受害」。
+
 **随机性**：发球 `vx` 带随机散布，某些漏接只在特定扰动耦合下出现。所以 `npm test` **连跑 3 次**才算稳，`npm run sim` 用 6 个种子；单次通过不作数。
 
 ## 8.6 没覆盖什么
@@ -113,6 +127,7 @@ npm test
 - **真机挥拍穿模**：没有真机自动化测试，也没有回放/录像；排查只能靠现场观察 + HUD 瞬时读数（`docs/known-issues.md` 7.4）。
 - **浏览器侧一切**：传感器事件、WebRTC/信令（除 `test:signal` 冒烟）、HTTPS 证书、three.js 渲染、HUD、手机端 UI，全都不在 `npm test` 里。
 - **视觉走位的摄像头侧**：8 条单测只证明 `vision-math.ts` 的纯计算自洽；`getUserMedia`、取帧、色块丢失保持、镜像方向、光照鲁棒性全都跑不到。见 `docs/vision.md` 第 5 节的真机取证步骤。
+- **对打模式的浏览器侧**：整场线条、对手球拍、相机、比分 HUD、墙打与对打两个 dev server 同时开着会不会抢信令房间，全都只有代码层保证（`npm run build` 能证明的只是能打包）。`pickIntercept` 的**选点策略**（选哪个迎击点最舒服）也只有 `npm run duel-sim` 能反映，单测只钉住「在本方半场」这类不变量。
 - **性能与长稳**：帧率、内存、`liftOverNet` 的计算开销（一次回球约 33 条候选 × 每条最多 1600 步）没有基准测试。
 - **位姿是理想化的**：测试走位用物理前推 + 限速，比真人准；姿态用构造的四元数，不含传感器噪声、安装角误差和手部抖动（见 `docs/motion-accuracy.md`）。
 - **改常量的联动**：`FACE_*`、`FEED_*`、`HIT_WINDOW_MS` 同时决定判定、喂球和测试期望。改之前先读 `docs/tuning.md` 5.1–5.4，改完按 `AGENTS.md` 第 3 节跑三件事：`npm test` ×3 → `npm run sim`（30/30）→ `npm run build`。

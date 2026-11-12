@@ -57,9 +57,14 @@ function probeHints() {
 
 const steps = FAST
   ? [['npm test', 'test', 1], ['npm run build', 'build', 1]]
-  : [['npm test', 'test', 3], ['npm run sim', 'sim', 1], ['npm run build', 'build', 1]];
+  : [
+      ['npm test', 'test', 3],
+      ['npm run sim', 'sim', 1],
+      ['npm run duel-sim', 'duel-sim', 1],
+      ['npm run build', 'build', 1],
+    ];
 
-console.log(FAST ? '验证 · 快检（test ×1 → build）' : '验证 · 全套（test ×3 → sim → build）');
+console.log(FAST ? '验证 · 快检（test ×1 → build）' : '验证 · 全套（test ×3 → sim → duel-sim → build）');
 
 for (const [label, script, times] of steps) {
   if (!run(label, script, times)) {

@@ -32,6 +32,8 @@ execFileSync(
     'src/core/racket.ts',
     'src/core/physics.ts',
     'src/core/rally.ts',
+    // 自动走位：`scripts/sim-e2e.cjs` 用 MOVE=auto 对比「自动走位 vs 人站着不动」
+    'src/core/auto-move.ts',
     '--outDir',
     out,
     '--rootDir',
