@@ -42,25 +42,6 @@
       <div id="s-hint" class="g-hint"></div>
     </div>
 
-    <div id="vision-hud" class="vision-hud" hidden>
-      <div class="vh-head">
-        <span>视觉走位</span>
-        <span id="v-status" class="vh-status">正在请求摄像头权限…</span>
-      </div>
-      <div class="vh-row">
-        <span class="k">像素质心</span><span class="v" id="v-pixel">—</span>
-        <span class="k">推算站位</span><span class="v" id="v-pos">—</span>
-        <span class="k">色块</span><span class="v" id="v-area">—</span>
-      </div>
-      <div class="vh-row">
-        <span class="k">丢失帧</span><span class="v" id="v-lost">0</span>
-        <span class="k">处理帧率</span><span class="v" id="v-hz">—</span>
-      </div>
-      <canvas id="vision-preview" width="320" height="240"></canvas>
-      <div class="vh-detail" id="v-detail"></div>
-      <div class="vh-cfg" id="v-cfg"></div>
-    </div>
-
     <div class="linkpanel">
       <div class="lp-head">
         <span>链路</span>
@@ -90,7 +71,7 @@
 
     <div class="hint-bar">
       <kbd>WASD</kbd> 手动走位 · <kbd>F</kbd> 自动走位 · <kbd>拖动</kbd> 环视 · <kbd>M</kbd> 模拟控制器 ·
-      <kbd>X</kbd> 声音 · <kbd>C</kbd> 重开一局 · <kbd>R</kbd> 重置统计 · <kbd>V</kbd> 视觉 / 键盘对照
+      <kbd>X</kbd> 声音 · <kbd>C</kbd> 重开一局 · <kbd>R</kbd> 重置统计
     </div>
 
     <script type="module" src="/src/play/duel-main.ts"></script>

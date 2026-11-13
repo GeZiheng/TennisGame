@@ -41,7 +41,6 @@ execFileSync(
     // 自动走位：纯函数（预测 + 限速步进），玩家侧唯一一段能单测的决策逻辑
     'src/core/auto-move.ts',
     'src/play/stats.ts',
-    'src/play/vision-math.ts',
     '--outDir',
     out,
     // 不写 rootDir 的话，tsc 会按「输入文件的公共父目录」推导，

@@ -393,6 +393,12 @@ export class Rally {
     // 这条不是为了真实感，是为了打断一个正反馈：不加它的话，连续全力挥会让
     // 击球点一拍比一拍高（球回来得太快、来不及下落），五拍之后就够不着了。
     // 模拟里实测每拍 +0.35 米，是必须处理的系统性问题，不是偶发。
+    //
+    // 11-13 试过把门槛从 1.35 抬到 1.7（握点抬到 1.3 之后，按理接触点也高了），
+    // 结果 `npm run sim` 在「大力」档挂了一个种子：球变快之后，挥拍中段把拍面
+    // 甩到球前面去，反而更接不到。所以滑动门槛这件事被证据否掉了——真正该动的
+    // 是**击球点**：自动走位的握点高度控制把接触点从 1.9m 拉回 1.35–1.6m，
+    // 折扣本身就回到 0.9 以上了（见 `docs/history.md` 4.20）。
     const pen = at[1] > 1.35 ? Math.max(0.62, 1 - (at[1] - 1.35) * 0.34) : 1;
     const v: V3 =
       pen < 1 ? [shot.v[0] * pen, shot.v[1] * pen, shot.v[2] * pen] : shot.v;
@@ -408,6 +414,11 @@ export class Rally {
     const pose = this.rackets.at(this.contactAt) ?? this.rackets.last;
     const q: Quat4 = pose ? pose.q : [0, 0, 0, 1];
     const w = vrot(q, [0, FACE_CY, 0]);
+    // 回球瞄「击球高度」（钳到 0.9–1.9）。11-13 试过把上限收到 1.7，理由是
+    // 「瞄 1.9 = 一条 21.6m 外落界内、到面还那么高的月亮球，玩家觉得球慢慢飘」。
+    // 但单改这个也会让 `npm run sim` 大力档挂种子：回球变快之后挥拍模型跟不上。
+    // 真正让球变快的是**击球点**——自动走位把接触点从 1.9m 拉回 1.35–1.6m 之后，
+    // 高球折扣自然回到 0.9 以上，不必再压这个上限（见 `docs/history.md` 4.20）。
     const aimY = Math.min(1.9, Math.max(0.9, at[1]));
     const goal: RacketPose = {
       t: pose ? pose.t : this.contactAt,

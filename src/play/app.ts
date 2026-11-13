@@ -12,7 +12,7 @@ import { LatencyWindow, PacketStats, ClockSync } from './stats';
 import { SwingDetector } from '../core/swing';
 import { Rally, type RallyEvent } from '../core/rally';
 import { Duel, type DuelEvent } from '../core/duel';
-import { FACE_CY, HIT_WINDOW_MS, HIT_Z, RACKET_POS } from '../core/court';
+import { FACE_CY, HIT_WINDOW_MS, RACKET_POS } from '../core/court';
 import { faceCenter } from '../core/racket';
 import {
   AUTO_MOVE_DEFAULTS,
@@ -22,8 +22,6 @@ import {
   type AutoMoveState,
 } from '../core/auto-move';
 import { MockController } from './mock';
-import { VISION_DEFAULTS } from './vision-math';
-import { VisionTracker } from './vision';
 
 /**
  * 一局游戏的**完整前端**：连接、收包、挥拍检测、走位、渲染、HUD。
@@ -87,47 +85,14 @@ const qs = new URLSearchParams(location.search);
 const room = (qs.get('room') ?? randomRoom()).toUpperCase().slice(0, 4);
 
 /**
- * 视觉走位是实验通道，默认完全关闭：不加参数时这一整条代码不产生任何行为。
- * ?vision=probe 只显示读数、不接走位；?vision=1 才把左右站位交给摄像头。
- * 参数见 docs/vision.md，全部有缺省值，真机调色块时不用改代码。
- */
-const huePresets: Record<string, number> = { magenta: 310, green: 75, blue: 210, yellow: 45, red: 0 };
-const numArg = (key: string, def: number) => {
-  const n = Number(qs.get(key));
-  return Number.isFinite(n) && n > 0 ? n : def;
-};
-const hueArgRaw = qs.get('hue');
-const hueArg = hueArgRaw === null
-  ? VISION_DEFAULTS.hue
-  : (huePresets[hueArgRaw.toLowerCase()]
-    ?? (hueArgRaw.trim() !== '' && Number.isFinite(Number(hueArgRaw)) ? Number(hueArgRaw) : VISION_DEFAULTS.hue));
-const visionMode = qs.get('vision');
-const vision = visionMode === 'probe' || visionMode === '1' || visionMode === 'drive'
-  ? new VisionTracker({
-      mode: visionMode === 'probe' ? 'probe' : 'drive',
-      cfg: {
-        ...VISION_DEFAULTS,
-        hue: hueArg,
-        hueTol: numArg('tol', VISION_DEFAULTS.hueTol),
-        minArea: numArg('minarea', VISION_DEFAULTS.minArea),
-        tauMs: numArg('tau', VISION_DEFAULTS.tauMs),
-        maxX: numArg('range', VISION_DEFAULTS.maxX),
-      },
-      flip: qs.get('flip') === '1',
-      preview: qs.get('preview') !== '0',
-    })
-  : null;
-/** V 键：drive 模式下临时切回键盘，做 A/B 对照用。 */
-let visionOverride = false;
-
-/**
  * 自动走位：默认**开**，`?auto=0` 关，`F` 键临时切换。
  *
  * 它替代的是「一边盯来球一边按 A/D」这个对大部分人都太难的输入。判定、出球、
  * 挥拍检测一行没动——只是把玩家横向搬到球会经过的位置。要复现「跑不到位」的
- * 手感（或者拍演示视频）就按 F 关掉。
+ * 手感（或者拍演示视频）就按 F 关掉。键盘随时可以顶替它（手动永远优先）。
  *
- * 视觉走位开着时自动让位（两路都写 `PLAYER.x` 会打架），见 `updatePlayer`。
+ * 玩家这一侧只负责挥拍。11-10 到 11-13 之间还有过一条「摄像头追胸口色块」的
+ * 输入通道，11-13 决定撤掉（用户明说近期不需要），见 `docs/history.md` 4.21。
  */
 let autoMove = qs.get('auto') !== '0';
 
@@ -531,9 +496,6 @@ function updateHud() {
         : ['环境不稳', 'bad'];
   verdictEl.textContent = verdict[0];
   verdictEl.className = `verdict ${verdict[1]}`;
-
-  // 视觉诊断只在开关打开时才有节点内容；200ms 刷一次就够，别每帧写 DOM。
-  vision?.updateHud();
 }
 
 /* ---------------- 延迟曲线 ---------------- */
@@ -638,11 +600,6 @@ async function boot() {
   setInterval(() => link?.sendCtrl({ t: 'ping', t0: performance.now() }), 700);
   setInterval(updateHud, 200);
   setInterval(drawSpark, 140);
-
-  if (vision) {
-    $<HTMLElement>('vision-hud').hidden = false;
-    void vision.start();
-  }
 }
 
 /* ---------------- 走位 ---------------- */
@@ -650,23 +607,20 @@ async function boot() {
 /**
  * 站位。刻意和球拍姿态完全分开。
  *
- * 姿态来自手机（绝对朝向），位置来自键盘（相对速度）——两者混在一个输入里，
+ * 姿态来自手机（绝对朝向），位置来自脚本或键盘（相对速度）——两者混在一个输入里，
  * 「举着手机往右倾」就会同时想改朝向和位置，手感会互相打架。
  *
  * 为什么必须有它：严格碰撞上线后，可击球面积就是真实的 30×38cm 拍面，
  * 而球回来的横向落点是 ±1 米级别。拍子不能平移的话，命中率只有两成左右，
  * 玩家会觉得「这游戏判定有问题」，而实际上是「你站着没动」。
  *
- * 视觉通道（?vision=1）是另一路输入：摄像头追胸口色块，只给左右 x，
- * 前后 z 固定在击球面。默认键盘路径一行没改，方便 A/B 对照和随时回退。
- * 详见 `docs/vision.md`。
- *
- * 自动走位是第三路，也是默认那一路：`core/auto-move.ts` 预测来球穿过击球面时的
- * 横向位置，把玩家按限速搬过去，剩下挥拍交给玩家。键盘按下去时它立刻让位——
- * 手动永远优先，松手才接回来。
+ * 两路输入，优先级 键盘 > 自动：自动走位是默认那一路（`core/auto-move.ts`
+ * 预测来球穿过击球面时的位置，把玩家按限速搬过去），键盘按下去时它整帧让位——
+ * 手动永远优先，松手才接回来。玩家这一侧只负责挥拍。
  */
 const PLAYER = {
   x: AUTO_MOVE_DEFAULTS.homeX,
+  y: RACKET_POS[1],
   z: AUTO_MOVE_DEFAULTS.homeZ,
   /** 手动走位速度。真实球员横移 4–5 m/s，取 4.2 让「跑不到位」是一种失误但不算苛刻。 */
   speed: 4.2,
@@ -675,20 +629,13 @@ const PLAYER = {
   maxX: AUTO_MOVE_DEFAULTS.maxX,
   minZ: AUTO_MOVE_DEFAULTS.minZ,
   maxZ: AUTO_MOVE_DEFAULTS.maxZ,
+  minY: AUTO_MOVE_DEFAULTS.minGripY,
+  maxY: AUTO_MOVE_DEFAULTS.maxGripY,
 };
 
 const held = new Set<string>();
 
 function updatePlayer(dt: number) {
-  // 视觉接管：只写 x，z 固定在击球面，键盘走位整个跳过（两路输入会打架）。
-  // 摄像头没跑起来时退回键盘——权限被拒也不至于把玩家卡在原地。
-  if (vision && vision.mode === 'drive' && vision.running && !visionOverride) {
-    PLAYER.x = vision.x;
-    PLAYER.z = HIT_Z;
-    scene.setRacketBase(PLAYER.x, RACKET_POS[1], PLAYER.z);
-    return;
-  }
-
   let ax = 0;
   let az = 0;
   if (held.has('a') || held.has('arrowleft')) ax -= 1;
@@ -703,9 +650,12 @@ function updatePlayer(dt: number) {
     const step = (PLAYER.speed * dt) / l;
     PLAYER.x = Math.min(PLAYER.maxX, Math.max(-PLAYER.maxX, PLAYER.x + ax * step));
     PLAYER.z = Math.min(PLAYER.maxZ, Math.max(PLAYER.minZ, PLAYER.z + az * step));
-    // 第三个参数是**击球锚点**的高度（拍面中心），不是握点高度。
-    // 站位移动搬的是握点。手机只给角度，挪位置是键盘的事，两者互不干扰。
-    scene.setRacketBase(PLAYER.x, RACKET_POS[1], PLAYER.z);
+    // 键盘手动走位不接管高度：人一旦自己动手，握点高度缓缓回到自然位，
+    // 免得「蹲着的时候按 D」变成蹲着横移（那不是玩家想要的动作）。
+    PLAYER.y = stepAxis(PLAYER.y, RACKET_POS[1], AUTO_MOVE_DEFAULTS.speedY * dt, 0.01);
+    // 第三个参数是**握点**高度。站位移动搬的是握点，姿态只由手机决定，
+    // 两者互不干扰。
+    scene.setRacketBase(PLAYER.x, PLAYER.y, PLAYER.z);
     return;
   }
 
@@ -715,13 +665,17 @@ function updatePlayer(dt: number) {
   // x 补偿握法偏移（横握时中心在握点侧方半米），z 决定「球到面时的高度」——
   // 只调 x 的话，球高了低了都只能干看着。
   const cfg = AUTO_MOVE_DEFAULTS;
-  const state: AutoMoveState = { x: PLAYER.x, z: PLAYER.z, center: centerOffset };
+  const state: AutoMoveState = { x: PLAYER.x, y: PLAYER.y, z: PLAYER.z, center: centerOffset };
   const plan = planAutoMove(game.ball, state, cfg);
   const speed = plan.chasing ? cfg.speed : cfg.homeSpeed;
   const speedZ = plan.chasing ? cfg.speedZ : cfg.homeSpeed;
   PLAYER.x = Math.min(PLAYER.maxX, Math.max(-PLAYER.maxX, stepAxis(PLAYER.x, plan.target, speed * dt, cfg.deadband)));
   PLAYER.z = Math.min(PLAYER.maxZ, Math.max(PLAYER.minZ, stepAxis(PLAYER.z, plan.targetZ, speedZ * dt, cfg.deadband)));
-  scene.setRacketBase(PLAYER.x, RACKET_POS[1], PLAYER.z);
+  // 高度这一维**永远**按 speedY 走，不跟 chasing 挂钩：回位时要站起来，
+  // 追球时要蹲下去，两件事都必须是「立刻到位」。
+  PLAYER.y = Math.min(PLAYER.maxY, Math.max(PLAYER.minY,
+    stepAxis(PLAYER.y, plan.targetY, cfg.speedY * dt, cfg.deadband)));
+  scene.setRacketBase(PLAYER.x, PLAYER.y, PLAYER.z);
 }
 
 /* ---------------- 主循环 ---------------- */
@@ -798,14 +752,6 @@ addEventListener('keydown', (e) => {
     flashHint(sfx.isMuted ? '静音' : '已开启声音');
   }
   if (k === 'c') game.reset();
-  if (k === 'v') {
-    if (!vision) flashHint('视觉走位未启用：地址加 ?vision=probe 或 ?vision=1');
-    else if (vision.mode === 'probe') flashHint('只读取证中：右上角是读数，不接管走位');
-    else {
-      visionOverride = !visionOverride;
-      flashHint(visionOverride ? '已切回键盘走位（对照）' : '已交给摄像头走位');
-    }
-  }
   if (k === 'f') {
     autoMove = !autoMove;
     flashHint(autoMove ? '自动走位已开：只要挥拍' : '自动走位已关：A/D 手动跑位');
@@ -822,7 +768,6 @@ addEventListener('pointerdown', () => sfx.unlock(), { once: true });
 
 addEventListener('beforeunload', () => {
   mock.stop();
-  vision?.stop();
   link?.close();
 });
 

@@ -1120,12 +1120,28 @@ export function sampleCrossings(ball: Ball, zA: number, zB: number, step = 0.1):
   const b = makeBall(ball.p, ball.v, ball.spin);
   b.bounces = ball.bounces;
   let t = 0;
+  // 落地次数。**第二次在我方半场落地时这一球就死了**（`rally` / `duel` 的
+  // 「两次落地」规则），再往后推出来的是不存在的弹道。
+  //
+  // 这不是优化，是正确性。不截断时规划器会看到「球二次弹起后还会飘到 z=0.3」，
+  // 于是让人站在击球面等着，而球在 1.7 米外就判死了——实测这正是「网前的球
+  // 走不过去」里最大的一类：球落在 z≈-8，弹一下在 z≈-1.4 就二次落地
+  //（实测 vz=13 / vy=5.5 那一条：-8.01 → -1.40）。
+  // 判据要跟判决处完全一致（`bounces >= 2` 且落点在我方半场），不能只数「从现在
+  // 起还要弹几次」——来球往往已经弹过一次了。
+  let bounces = ball.bounces;
+  let dead = false;
 
   for (let i = 0; i < 240 * 3; i++) {
     const p0: V3 = [b.p[0], b.p[1], b.p[2]];
     const t0 = t;
-    advance(b, PHYS_DT, () => {});
+    advance(b, PHYS_DT, (c) => {
+      if (c.kind !== 'ground') return;
+      bounces++;
+      if (bounces >= 2 && c.at[2] > NET_Z) dead = true;
+    });
     t += PHYS_DT;
+    if (dead) break;
     const p1 = b.p;
     const dz = p1[2] - p0[2];
 

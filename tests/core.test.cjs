@@ -5,7 +5,6 @@ const { deviceEulerToWorldQuat, qYaw, toOutputQuat, qAngle,
   worldYawDelta, isYawGimbal, YawDriftObserver,
   PoseContinuityGate, MAX_POSE_JUMP, MAX_EXTRAP_MS } = require('./core/attitude.js');
 const { LatencyWindow, ClockSync, PacketStats } = require('./play/stats.js');
-const { VISION_DEFAULTS, rgbToHsv, hueDistance, hsvHit, buildMask, largestBlob, detect, mapPixelX, lowPass } = require('./play/vision-math.js');
 const { SwingDetector, shotFromStroke } = require('./core/swing.js');
 const { omegaFromQuatDelta } = require('./core/gyro.js');
 const { makeBall, advance, liftOverNet, aimIntoCourt, setWallActive, predictAtPlane, sampleCrossings } = require('./core/physics.js');
@@ -1568,101 +1567,6 @@ t('走位到位时能连续打到球，且甜区偏离是「附近」而不是�
   );
 });
 
-console.log('视觉走位（纯计算）');
-
-// 32×24 的合成画面：底色是低饱和浅灰，命中色是品红（h=300，默认 hue=310 ±24）。
-const VW = 32;
-const VH = 24;
-function vframe(paint) {
-  const d = new Uint8ClampedArray(VW * VH * 4);
-  for (let i = 0; i < VW * VH; i++) {
-    const p = i << 2;
-    d[p] = 240; d[p + 1] = 240; d[p + 2] = 240; d[p + 3] = 255;
-  }
-  if (paint) paint(d);
-  return d;
-}
-function vrect(d, x0, y0, x1, y1) {
-  for (let y = y0; y < y1; y++) {
-    for (let x = x0; x < x1; x++) {
-      const p = (y * VW + x) << 2;
-      d[p] = 255; d[p + 1] = 0; d[p + 2] = 255;
-    }
-  }
-}
-
-t('rgbToHsv 给出正确的色相、饱和度和明度', () => {
-  const near = (a, b) => assert.ok(Math.abs(a - b) < 1e-6, `${a} ≠ ${b}`);
-  near(rgbToHsv(255, 0, 0).h, 0);
-  near(rgbToHsv(0, 255, 0).h, 120);
-  near(rgbToHsv(0, 0, 255).h, 240);
-  near(rgbToHsv(255, 0, 255).h, 300);
-  near(rgbToHsv(128, 128, 128).s, 0);
-  near(rgbToHsv(128, 128, 128).v, 128 / 255);
-});
-
-t('hueDistance 是环形距离，跨 0/360 不会算成 358 度', () => {
-  assert.strictEqual(hueDistance(359, 1), 2);
-  assert.strictEqual(hueDistance(350, 10), 20);
-  assert.strictEqual(hueDistance(0, 180), 180);
-  assert.strictEqual(hueDistance(310, 310), 0);
-});
-
-t('hsvHit 挡掉低饱和、低明度和色相不符的像素', () => {
-  const c = VISION_DEFAULTS;
-  assert.strictEqual(hsvHit(310, 1, 1, c), true);
-  assert.strictEqual(hsvHit(300, 1, 1, c), true, '品红 300 落在 310±24 内');
-  assert.strictEqual(hsvHit(310, 0.1, 1, c), false, '白墙不能被当成色块');
-  assert.strictEqual(hsvHit(310, 1, 0.1, c), false, '暗背景不能被当成色块');
-  assert.strictEqual(hsvHit(20, 1, 1, c), false, '差 70 度的红色不算');
-});
-
-t('largestBlob 只认最大连通块，同色噪点拽不偏质心', () => {
-  const d = vframe((buf) => {
-    vrect(buf, 10, 8, 16, 14);   // 36 像素的大块
-    vrect(buf, 0, 0, 2, 2);      // 4 像素的干扰块
-  });
-  const blob = largestBlob(buildMask(d, VISION_DEFAULTS), VW, VH);
-  assert.ok(blob, '应该找到色块');
-  assert.strictEqual(blob.area, 36);
-  assert.ok(Math.abs(blob.cx - 12.5) < 1e-6, `质心 x 应为 12.5，实际 ${blob.cx}`);
-  assert.ok(Math.abs(blob.cy - 10.5) < 1e-6, `质心 y 应为 10.5，实际 ${blob.cy}`);
-});
-
-t('largestBlob 空掩码返回 null', () => {
-  assert.strictEqual(largestBlob(buildMask(vframe(), VISION_DEFAULTS), VW, VH), null);
-});
-
-t('detect 用面积门槛挡掉小噪点', () => {
-  const small = vframe((buf) => vrect(buf, 3, 3, 6, 6)); // 9 像素 < minArea 24
-  assert.strictEqual(detect(small, VW, VH, VISION_DEFAULTS), null);
-  const big = vframe((buf) => vrect(buf, 10, 8, 16, 14));
-  const b = detect(big, VW, VH, VISION_DEFAULTS);
-  assert.ok(b && b.area === 36, '36 像素的色块必须检出');
-});
-
-t('mapPixelX 线性映射并在两端钳位', () => {
-  const near = (a, b) => assert.ok(Math.abs(a - b) < 1e-6, `${a} ≠ ${b}`);
-  near(mapPixelX(15.5, VW, 1.2), 0);
-  near(mapPixelX(0, VW, 1.2), -1.2);
-  near(mapPixelX(VW - 1, VW, 1.2), 1.2);
-  near(mapPixelX(-20, VW, 1.2), -1.2);
-  near(mapPixelX(999, VW, 1.2), 1.2);
-});
-
-t('lowPass 单调收敛、不过冲，退化参数直通', () => {
-  let x = 0;
-  for (let i = 0; i < 40; i++) {
-    const next = lowPass(x, 1, 250, VISION_DEFAULTS.tauMs);
-    assert.ok(next <= 1 + 1e-9, '低通不能过冲');
-    assert.ok(next >= x, '低通必须单调朝目标收敛');
-    x = next;
-  }
-  assert.ok(x > 0.99, `40 步后应该基本收敛，实际 ${x}`);
-  assert.strictEqual(lowPass(0, 1, 16, 0), 1, 'tau=0 表示不平滑');
-  assert.strictEqual(lowPass(0.4, 1, 0, 250), 0.4, 'dt=0 时保持');
-});
-
 /* ================= 对打（脚本回球机 + 判分） =================
  *
  * 这一整节都跑在「练习墙关掉」的前提下：球从对手底线附近起飞，而练习墙就在
@@ -1780,15 +1684,31 @@ t('横握时补偿拍面中心的横向偏移：握点要站到球的侧边半�
     `横握要少走约 0.6m，实际竖 ${vert.target.toFixed(2)} / 横 ${horiz.target.toFixed(2)}`);
 });
 
-t('前后走位：拍面中心低（横握）时往后退，让球降到拍面高度', () => {
+t('高低差靠举拍/屈膝解决，不再靠前后跑', () => {
+  // 这是 11-13 第二次修正的核心：握点高度变成第三个自由度之后，「球高了」的答案
+  // 不再是「退到球掉下来」，而是「把拍子沉下去」。后者既不退到场外，也不会把球
+  // 接在腰以下（那正是「看着打上了却没打上」的根源）。
   const b = duelShot([1.4, 1.45]);
-  const vert = planAutoMove(b, VERT()); // 中心 1.6m，和来球高度基本一致
-  const horiz = planAutoMove(b, HORIZ()); // 中心 1.0m，得等球掉下来
-  assert.ok(horiz.targetZ > vert.targetZ + 0.5,
-    `横握站位 ${horiz.targetZ.toFixed(2)} 应明显比竖握 ${vert.targetZ.toFixed(2)} 靠后`);
-  assert.ok(horiz.hitY < vert.hitY,
-    `横握接到的球应该更低：${horiz.hitY && horiz.hitY.toFixed(2)} vs ${vert.hitY && vert.hitY.toFixed(2)}`);
-  assert.ok(horiz.targetZ <= AUTO_MOVE_DEFAULTS.maxZ + 1e-9, '不能退到场外');
+  const vert = planAutoMove(b, VERT());
+  const horiz = planAutoMove(b, HORIZ());
+  assert.equal(vert.chasing, true);
+  assert.equal(horiz.chasing, true);
+
+  // 拍面中心 = 握点 + 中心偏移。选出来的握点高度必须让拍面正好落在球的到面高度上
+  assert.ok(Math.abs(vert.targetY + FACE_CY - vert.hitY) < 0.03,
+    `竖握：握点 ${vert.targetY.toFixed(2)} + 0.6 应等于球高 ${vert.hitY && vert.hitY.toFixed(2)}`);
+  assert.ok(Math.abs(horiz.targetY + 0 - horiz.hitY) < 0.03,
+    `横握：握点 ${horiz.targetY.toFixed(2)} 应等于球高 ${horiz.hitY && horiz.hitY.toFixed(2)}`);
+  // 竖握要沉到 0.85 一带（屈膝），横握几乎不用动（来球本来就对着胸口）
+  assert.ok(vert.targetY < RACKET_POS[1] - 0.3, `竖握应该屈膝，实际握点 ${vert.targetY.toFixed(2)}`);
+  assert.ok(Math.abs(horiz.targetY - RACKET_POS[1]) < 0.25, `横握不该大动，实际 ${horiz.targetY.toFixed(2)}`);
+  // 两种握法都不为高度退/进太多
+  assert.ok(Math.abs(vert.targetZ - AUTO_MOVE_DEFAULTS.homeZ) < 0.4,
+    `竖握站位不该为高度跑动：${vert.targetZ.toFixed(2)}`);
+  assert.ok(Math.abs(horiz.targetZ - AUTO_MOVE_DEFAULTS.homeZ) < 0.4,
+    `横握站位不该为高度跑动：${horiz.targetZ.toFixed(2)}`);
+  // 握点高度必须落在身体范围内
+  assert.ok(vert.targetY >= AUTO_MOVE_DEFAULTS.minGripY - 1e-9 && vert.targetY <= AUTO_MOVE_DEFAULTS.maxGripY + 1e-9);
 });
 
 t('不朝我飞就不追：几乎没有前进速度的慢球不当成来球', () => {
@@ -1808,14 +1728,34 @@ t('不朝我飞就不追：飞向对面的球也不追', () => {
   assert.equal(plan.target, 0);
 });
 
-t('已经从我身边过去的球不追（追不上，只会把人拖走）', () => {
-  // 「过去」的判据是球已经越过拍面能覆盖的最深处（maxZ + 中心偏移），
-  // 不是「越过 HIT_Z」——站得靠后时球在 HIT_Z 之后仍然来得及。
-  const behind = makeBall([1.4, 1.2, AUTO_MOVE_DEFAULTS.maxZ + 0.5], [0, 0.2, 5]);
-  assert.equal(planAutoMove(behind, VERT()).chasing, false);
-  // 同样位置但还在可站范围内：必须追
-  const front = makeBall([1.4, 1.2, AUTO_MOVE_DEFAULTS.maxZ - 0.3], [0, 0.2, 5]);
-  assert.equal(planAutoMove(front, VERT()).chasing, true, '还在可及范围内就该追');
+t('球越过拍面所在平面就站住：不跟着球往后跑', () => {
+  // 旧版用 maxZ（底线外）当上界，于是球飞过身侧之后规划器还在往后找一个
+  // 「更高/更低」的平面，人就被球牵着退——玩家看到的是「球贴着我飞、拍子却够不到」。
+  // 现在判据是**拍面所在平面**：过了就站住，这一拍认了。
+  const behind = makeBall([1.4, 1.2, HIT_Z + 0.4], [0, 0.2, 5]);
+  const plan = planAutoMove(behind, VERT());
+  assert.equal(plan.chasing, false);
+  assert.equal(plan.target, 0, '站住 = 目标就是当前位置');
+  assert.equal(plan.targetZ, HIT_Z);
+
+  // 还差 1 米才到身边：必须追
+  const front = makeBall([1.4, 1.2, HIT_Z - 1.0], [0, 0.2, 5]);
+  assert.equal(planAutoMove(front, VERT()).chasing, true, '还没到身边就该追');
+});
+
+t('网前的短球要往前迎，不是站在击球面等它二次落地', () => {
+  // 这条球弹起后最高只到 0.86m，在 z≈-1.0 就二次落地判死（弹道采样在这里截断）。
+  // 规划器必须把目标放到身前一米以上，否则玩家会站在原地等一颗永远到不了的球。
+  const b = makeBall([0, 0.9, -6], [0, 3.0, 4.0]);
+  const pts = sampleCrossings(b, AUTO_MOVE_DEFAULTS.minZ, AUTO_MOVE_DEFAULTS.maxZ);
+  assert.ok(pts.length > 4, `应该采到几个点，实际 ${pts.length}`);
+  assert.ok(pts[pts.length - 1].z < HIT_Z - 0.5,
+    `二次落地之后不该再采样，最远只到 z=${pts[pts.length - 1].z.toFixed(2)}`);
+  const plan = planAutoMove(b, VERT());
+  assert.equal(plan.chasing, true);
+  assert.ok(plan.targetZ < AUTO_MOVE_DEFAULTS.homeZ - 1.0,
+    `要往前迎：目标 z=${plan.targetZ.toFixed(2)}`);
+  assert.ok(plan.targetZ >= AUTO_MOVE_DEFAULTS.minZ - 1e-9, '不能跑出可站范围');
 });
 
 t('球已经死了就回中线，不留在原地发呆', () => {

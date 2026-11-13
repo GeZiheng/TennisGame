@@ -395,7 +395,7 @@ export class Duel {
     if (!at) return;
 
     const shot = shotFromStroke(s);
-    // 高球不好发力，理由同墙打：打断「越打越高」的正反馈
+    // 高球不好发力，理由同墙打：打断「越打越高」的正反馈（见 rally.ts 的说明）
     const pen = at[1] > 1.35 ? Math.max(0.62, 1 - (at[1] - 1.35) * 0.34) : 1;
     const v: V3 = [shot.v[0] * pen, shot.v[1] * pen, shot.v[2] * pen];
 

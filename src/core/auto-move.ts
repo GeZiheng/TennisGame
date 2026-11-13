@@ -5,31 +5,45 @@
  *
  * 严格碰撞上线后，可击球面积就是真实的 30×38cm 拍面；来球的散布是米级。拍子不能
  * 平移的话命中率只有两成——玩家会觉得「判定有问题」，实际上是「你站着没动」。
- * 这个模块只做一件事：把玩家搬到球会经过的位置，**挥拍仍然留给玩家**。
+ * 这个模块把玩家搬到球会经过的位置，**挥拍仍然留给玩家**。
  *
- * ## 走的是拍面中心，不是握点（11-13 修正）
+ * ## 三个自由度：x / z / y（11-13 第二次修正）
  *
- * 拍面中心挂在握点沿拍柄 0.6m 的杆子末端（`pos + R(q)·(0, FACE_CY, 0)`）。握法一横，
- * 这根杆子就横过去，中心落在握点侧方 0.6m —— 而判定半轴只有 0.24m。所以「把握点 x
- * 对准球的 x」只在拍子竖直时成立；横握时人站对了、拍面却在半米外，看起来就是
- * 「明明够得到却打空」。这里改成让**拍面中心**落到弹道上：握点目标 = 穿面点 − 中心偏移。
+ * - **x 补偿握法**：拍面中心挂在握点沿拍柄 0.6m 的杆子末端（`faceCenter`）。握法一横，
+ *   这根杆子横过去，中心落在握点侧方 0.6m，而判定半轴只有 0.24m。所以「把握点 x 对准
+ *   球的 x」只在拍子竖直时成立；横握时人站对了、拍面却在半米外。
+ * - **z 决定「球到面时多高」**：同样的球，站前 0.5m 就高 0.4m。
+ * - **y 决定「拍面够不够得到那个高度」**：这是 11-13 补上的那一维，也是最关键的一维。
+ *   握点原来被锁死在 `RACKET_POS[1]`，拍面中心只能在半径 0.6m 的球壳上转 ⇒ 竖握时
+ *   拍面恒在 1.9m、横握恒在 1.3m。而回球机把球送到 1.3–1.6m，于是**竖握/斜握的玩家
+ *   每一球都是从拍面下方 20cm 掠过**：屏幕上看着擦到了，判定说没进椭圆。
+ *   真人对付高球会举拍、对付低球会屈膝，这一维就是那个动作。
  *
- * 偏移由 `app.ts` 用「没在挥拍的那几帧」估计后传进来（`AutoMoveState.center`）。
- * 不能直接用实时拍面中心：挥拍本身会把中心甩出 0.3–1.1m（`docs/history.md` 4.5），
- * 拿它当目标，玩家一挥拍人就被拽走。自动走位只补偿**握法**造成的静态偏移。
+ * ## 选点：先筛「够得着 + 来得及」，再挑「最省力」
  *
- * ## 为什么现在两个轴都动（11-13）
+ * 1. 沿弹道在我方可站区间里每 10cm 采一个穿面点（`sampleCrossings`）；
+ * 2. 每个点反解出握点 `(p.x - c.x, p.y - c.y, p.z - c.z)`——三个轴各自夹到身体范围内，
+ *    夹出去的差值就是「够不着」的量；
+ * 3. 只要球高出了握点的可调范围（`minGripY`–`maxGripY`），这个平面就**不合格**：
+ *    站在那儿也打不到，再近也没用。这是「离球太近却打不到」的直接解药；
+ * 4. 合格解里按「姿态偏离 + 站位偏离 + 横向出界 + 耗时」挑最省力的那个。
+ *    站位的权重高于姿态：宁可屈膝 20cm，也不愿意为了舒服退到底线外一米。
+ * 5. 一个都不合格时**不回到中线**，挑「总代价最小」的那个继续追：球已经发出去了，
+ *    站着看它落地是更差的选择。
  *
- * 前后（z）决定「球到面时的高度」：同样的球，站前 0.5m 就高 0.4m。只调 x 的话，
- * 球高了低了都只能干看着——竖直判定半轴只有 0.23m，而来球到面高度从 1.0m 到 1.7m
- * 都有（发球散布 + 落地重瞄 + 握法偏移各贡献一点），这个缺口不是横向能补的。
- * 所以沿弹道采样我方半场的可站区间，挑一个「球的高度最接近拍面中心、又来得及走过去」
- * 的平面，x 与 z 一起挪。
+ * ## 球已经到身边就别追了
+ *
+ * 旧版会用 `maxZ`（底线上 2m）当上界，于是球一旦飞过身侧，规划器还在往后找一个
+ * 「更高/更低」的平面，人就跟着球一路后退——玩家看到的是「球贴着我飞、拍子却够不到」。
+ * 现在球一旦越过拍面所在平面就**原地不动**：这一拍已经没救了，站住等下一球。
  *
  * ## 与其它输入通道的关系
  *
- * 视觉走位（`?vision=1`）和键盘都在 `app.ts` 里排在它前面：手动输入一存在，
- * 这一路就整帧不动，避免两路同时写 `PLAYER` 打架。
+ * 键盘（`WASD`）在 `app.ts` 里排在它前面：这一帧只要有方向键按下，这一路就整帧
+ * 不动，避免两路同时写 `PLAYER` 打架。手动永远优先，松手才接回来。
+ *
+ * 11-13 之前还有一条「摄像头追胸口色块」的视觉通道排在更前面，同日撤掉了
+ * （`docs/history.md` 4.21）：走位现在只有「脚本自动」和「键盘手动」两路。
  */
 
 import { HIT_Z, RACKET_POS } from './court';
@@ -41,6 +55,11 @@ export interface AutoMoveConfig {
   speed: number;
   /** 追球时的前后速度上限（m/s）。真人倒退比横移慢，而且退太多就没法发力。 */
   speedZ: number;
+  /**
+   * 握点升降速度（m/s）。屈膝、举拍是手臂和腿的动作，比跑动快得多——
+   * 这一维要「立刻到位」，否则球到面时拍面还在半路上，等于没这一维。
+   */
+  speedY: number;
   /** 没有来球时回中线的速度（m/s）。比追球慢，免得球刚离拍人就窜回去。 */
   homeSpeed: number;
   /** 目标死区（米）。差得比这还少就不动，否则会贴着球抖。 */
@@ -51,16 +70,24 @@ export interface AutoMoveConfig {
    */
   incomingVz: number;
   /**
-   * 到面高度偏离拍面中心多少以内算「接得到」（米）。
-   * 取竖直判定半轴 `FACE_RY + BALL_R`≈0.23 再留一点余量，只用来标记
-   * `reachable`（给 HUD 提示「该举拍/该退」），不参与选点——选点永远挑最接近的。
+   * 到面高度偏离拍面中心多少以内算「接得到」（米）。只用于标记 `reachable`
+   * （给 HUD 提示「该举拍/该退」），不参与选点。
    */
   yTol: number;
-  /** 站位的横向极限（米）。球更靠外时只能尽量靠近。 */
+  /**
+   * 站位的横向极限（米），默认 `HALF_WIDTH - 0.2`。
+   *
+   * 原来给 3.0，而单打边线在 4.115 —— 边线附近的球**永远**够不到：实测有一整类
+   * 漏接是这样，球在 x=-3.9 落地，人卡在 -2.96 看着。走位既然是为了「站到球会
+   * 经过的位置」，就该覆盖整块场地；留 0.2m 是给「站在线上不算出界」的余量。
+   */
   maxX: number;
-  /** 站位的纵深范围（米，握点 z）。 */
+  /** 站位的纵深范围（米，**握点** z）。 */
   minZ: number;
   maxZ: number;
+  /** 握点高度的可调范围（米）。下界 = 屈膝，上界 = 举拍。 */
+  minGripY: number;
+  maxGripY: number;
   /** 没有来球时的回位点。 */
   homeX: number;
   homeZ: number;
@@ -69,17 +96,37 @@ export interface AutoMoveConfig {
 export const AUTO_MOVE_DEFAULTS: AutoMoveConfig = {
   speed: 4.8,
   speedZ: 3.6,
+  speedY: 9,
   homeSpeed: 3.2,
   deadband: 0.05,
   incomingVz: 0.6,
   yTol: 0.2,
-  maxX: 3.0,
-  // 纵深：往前 0.55m 到离网 6.8m，往后 2.0m 到底线外 0.8m。
-  // 后端比「击球面 +1.35」更深：握点 1.0m 时横握中心只有 1.0m，要靠后退等球掉下来，
-  // 1.35 退到头球还有 1.15m。握点抬到 1.3 之后这段余量用不满，但低球/高球两端
-  // 都还要留空间，别再收回 +1.35。
-  minZ: HIT_Z - 0.55,
-  maxZ: HIT_Z + 2.0,
+  maxX: 3.9,
+  /**
+   * 纵深：往前 3.0m、往后 1.0m（握点 z）。
+   *
+   * 往前这一侧原来是 0.55m —— 等于「只能离击球面半步」，网前的短球只能看着。
+   * 判死的球里有一整类是这样：机器一记软球落在 z≈-8，弹起后最高不到 1m，在
+   * z≈-1.4 就二次落地 —— 它根本没到击球面。要接只能往前 2–3m 迎击，0.55m
+   * 连一半都不到。3.0m 大约是中场（离网 7.5m），再往前就不是「接球」而是
+   * 「冲网」了。往后收到 1.0m：退到底线（`BASELINE_Z`=1.5）就停。
+   *
+   * 实测一对（`.tmp-bench/bounce-probe`，从 -22.05 起手扫 vy/vz）：vz=13 / vy=5.5
+   * 第一落点 -8.01、第二落点 -1.40，正好是这一类。
+   */
+  minZ: HIT_Z - 3.0,
+  maxZ: HIT_Z + 1.0,
+  /**
+   * 握点高度：`RACKET_POS[1]` 上下各让一档。
+   *
+   * 向下 0.6m 是深屈膝（1.3 → 0.70），向上 0.35m 是举拍（→ 1.65）。
+   * 横握时拍面中心跟着握点走，这两个数直接决定「能接 0.70–1.65m 的球」；
+   * 竖握/斜握时再加 0.6 的竖直投影（14° 握法 +0.53）。回球机的到面带是 1.3–1.6，
+   * 两种握法都盖得住；而**落地后再掉到 1m 以下的球**只有把拍子沉下去才够得着，
+   * 0.45 那一档（面 1.38）差一点点，实测漏接全落在这一档上。
+   */
+  minGripY: RACKET_POS[1] - 0.6,
+  maxGripY: RACKET_POS[1] + 0.35,
   homeX: 0,
   homeZ: HIT_Z,
 };
@@ -90,6 +137,8 @@ export interface AutoMoveState {
   x: number;
   /** 当前握点 z */
   z: number;
+  /** 当前握点 y（缺省 = `RACKET_POS[1]`，老调用方的兼容路径）。 */
+  y?: number;
   /**
    * 拍面中心相对握点的偏移（世界系，长度恒为 0.6）。
    * 由 `app.ts` 在慢速帧里低通估计，挥拍时不更新。
@@ -102,7 +151,9 @@ export interface AutoMovePlan {
   target: number;
   /** 这一帧想去的握点 z（米）。 */
   targetZ: number;
-  /** true = 正在追这一球；false = 没有来球，正在回中线。 */
+  /** 这一帧想去的握点 y（米）。 */
+  targetY: number;
+  /** true = 正在追这一球；false = 没有来球 / 球已过身，正在回中或原地不动。 */
   chasing: boolean;
   /** 球到目标平面还有多久（秒）。不追球时为 null。 */
   eta: number | null;
@@ -115,28 +166,33 @@ export interface AutoMovePlan {
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
 /**
+ * 球越过拍面平面多远之后就不再追。
+ *
+ * 留 0.15m 是给「刚好压线」的球一点余量：球心越过拍面中心的 z 那一刻，球体还有
+ * 半径在后，判定仍然可能命中；超过这个量就真的过去了，再追只能往后跑。
+ */
+const PAST_MARGIN = 0.15;
+
+/**
  * 一帧的走位决策。纯函数：不读时间、不读全局，给定球、站位、握法偏移就一定给同一个答案。
  *
- * 选点顺序是「先筛来得及、再挑高度最接近」：
- *
- * 1. 沿弹道在我方可站区间里每 10cm 采一个穿面点（`sampleCrossings`）；
- * 2. 每个点换算成握点 `(p.x - center.x, p.z - center.z)`，横向超界就钳位并加惩罚
- *    ——球飘到边线外时还是要尽量靠近，不能干脆不追；
- * 3. 分轴估走到那儿要多久（横移 4.8 / 后退 3.6），超过球到面时间就淘汰；
- * 4. 剩下的按 `|球高 - 拍面中心高|` 排序，加 0.06·耗时 的微弱惩罚让目标在两帧
- *    之间连续（不然会在两个几乎等高的平面之间来回跳，人就原地抖）。
- *
- * 一个都来不及的时候**不回到中线**，而是挑「最赶得上」的那个继续追：球已经发出去了，
- * 站在原地看着它落地是更差的选择。
+ * 代价权重（米为单位的等效不适感）：
+ *   - 姿态偏离 `|gripY - RACKET_POS[1]|` × 0.9：屈膝/举拍是有代价的，但不大。
+ *   - 站位偏离 `|gripZ - homeZ|`       × 0.7：走一步比蹲一下更费劲。
+ *   - 横向出界 `|gripX - clamp|`       × 1.2：够不到边线球时也尽量贴着边站。
+ *   - 耗时 `need`                      × 0.06：让两帧之间的目标连续，不来回跳。
+ *   - 高度不够 `|gripY - clamp|`       × 3.0：只在没有合格解时兜底用——它是「打不到」。
  */
 export function planAutoMove(
   ball: Ball,
   state: AutoMoveState,
   cfg: AutoMoveConfig = AUTO_MOVE_DEFAULTS,
 ): AutoMovePlan {
+  const curY = state.y ?? RACKET_POS[1];
   const home: AutoMovePlan = {
     target: cfg.homeX,
     targetZ: cfg.homeZ,
+    targetY: RACKET_POS[1],
     chasing: false,
     eta: null,
     hitY: null,
@@ -147,51 +203,83 @@ export function planAutoMove(
   if (ball.v[2] <= cfg.incomingVz) return home;
 
   const c = state.center;
+  const faceZ = state.z + c[2];
+  // 已经从身边过去了：站住，不再跟着球往后跑
+  if (ball.p[2] >= faceZ + PAST_MARGIN) {
+    return {
+      target: state.x,
+      targetZ: state.z,
+      targetY: curY,
+      chasing: false,
+      eta: null,
+      hitY: ball.p[1],
+      reachable: true,
+    };
+  }
+
   // 握点能站的范围 + 中心偏移 = 拍面中心能覆盖的 z 区间
   const zLo = cfg.minZ + c[2];
   const zHi = cfg.maxZ + c[2];
-  // 已经从身边过去了
-  if (ball.p[2] >= zHi) return home;
 
-  const wantY = RACKET_POS[1] + c[1];
   const pts = sampleCrossings(ball, Math.max(ball.p[2], zLo), zHi);
   if (!pts.length) return home;
 
+  const neutralY = RACKET_POS[1];
   let best: PlaneHit | null = null;
   let bestX = cfg.homeX;
   let bestZ = cfg.homeZ;
+  let bestY = neutralY;
   let bestCost = Infinity;
-  // 来不及时的兜底：挑「需要时间 / 剩余时间」比值最小的
+
+  // 不合格的兜底：挑「高度差最小、又最赶得上」的，仍然往那儿走
   let late: PlaneHit | null = null;
   let lateX = cfg.homeX;
   let lateZ = cfg.homeZ;
+  let lateY = neutralY;
   let lateCost = Infinity;
 
   for (const p of pts) {
-    const rawX = p.x - c[0];
-    const wx = clamp(rawX, -cfg.maxX, cfg.maxX);
-    const wz = clamp(p.z - c[2], cfg.minZ, cfg.maxZ);
-    // 横向超出站位的部分按半价计：够不到也要尽量贴着边线站
-    const over = Math.abs(rawX - wx) * 0.5;
+    const gripX = p.x - c[0];
+    const gripZ = p.z - c[2];
+    const gripY = p.y - c[1];
+    const wx = clamp(gripX, -cfg.maxX, cfg.maxX);
+    const wz = clamp(gripZ, cfg.minZ, cfg.maxZ);
+    const wy = clamp(gripY, cfg.minGripY, cfg.maxGripY);
 
-    const need = Math.max(Math.abs(wx - state.x) / cfg.speed, Math.abs(wz - state.z) / cfg.speedZ);
-    const dy = Math.abs(p.y - wantY) + over;
+    const overX = Math.abs(gripX - wx);
+    const overY = Math.abs(gripY - wy);
+    const need = Math.max(
+      Math.abs(wx - state.x) / cfg.speed,
+      Math.abs(wz - state.z) / cfg.speedZ,
+      Math.abs(wy - curY) / cfg.speedY,
+    );
 
-    if (need <= p.t) {
-      const cost = dy + 0.06 * need;
+    // 够得着的判据只有一条：球高必须落在握点可调范围之内（±1cm 浮点余量）
+    const ok = overY <= 0.01 && need <= p.t;
+
+    if (ok) {
+      const cost =
+        0.9 * Math.abs(wy - neutralY) +
+        0.7 * Math.abs(wz - cfg.homeZ) +
+        1.2 * overX +
+        0.06 * need;
       if (cost < bestCost) {
         bestCost = cost;
         best = p;
         bestX = wx;
         bestZ = wz;
+        bestY = wy;
       }
     }
-    const lateScore = need / Math.max(p.t, 0.05) + over;
-    if (lateScore < lateCost) {
-      lateCost = lateScore;
+
+    const fallback =
+      3.0 * overY + 1.2 * overX + 0.7 * Math.abs(wz - cfg.homeZ) + need / Math.max(p.t, 0.05);
+    if (fallback < lateCost) {
+      lateCost = fallback;
       late = p;
       lateX = wx;
       lateZ = wz;
+      lateY = wy;
     }
   }
 
@@ -201,10 +289,11 @@ export function planAutoMove(
   return {
     target: best ? bestX : lateX,
     targetZ: best ? bestZ : lateZ,
+    targetY: best ? bestY : lateY,
     chasing: true,
     eta: pick.t,
     hitY: pick.y,
-    reachable: Math.abs(pick.y - wantY) <= cfg.yTol,
+    reachable: Math.abs(pick.y - (RACKET_POS[1] + c[1])) <= cfg.yTol,
   };
 }
 
