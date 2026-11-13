@@ -68,7 +68,7 @@ npm run dev          # HTTP，5173，不需要证书
 | `npm run dev:duel:https` | 对打 · 真机（HTTPS + 5184） |
 | `npm run dev:duel` | 对打 · 纯本地看画面（HTTP + 5183） |
 | `npm run build` | 类型检查 + 打包 |
-| `npm test` | 核心逻辑单测（125 项，不需要浏览器） |
+| `npm test` | 核心逻辑单测（140 项，不需要浏览器） |
 | `npm run sim` | 端到端模拟：假数据跑完整对拉，验证手感参数 |
 | `npm run duel-sim` | 对打模拟：3 档 × 6 种子，验回球机能不能连续接球 |
 | `npm run verify` | 全套验证：单测 ×3 → sim → duel-sim → build，任一步失败即退出（提交前的快检由 git hook 自动跑） |
@@ -138,10 +138,21 @@ npm run dev          # HTTP，5173，不需要证书
 |---|---|
 | `W` `A` `S` `D` | **手动走位**：前后左右移动站位（也可以用小键盘方向键）；一按就接管，松手交回自动 |
 | `F` | 自动走位开 / 关（默认开，见下） |
+| `Z` | **近景 / 全景**切换（墙打默认近景：拍子占画面 40%，方便看击球点） |
+| `G` | **挥拍枢轴**开 / 关（默认开：拍子绕腰/肘走弧；关掉就是老样子，绕拍柄底部转） |
 | `M` | 开 / 关本地模拟控制器 |
 | `C` | 重新开始（清连拍） |
 | `X` | 静音 / 取消静音 |
 | `R` | 清空延迟统计与峰值，并让手机重新标定姿态基准（拍子和手机歪了就按它） |
+
+### 挥拍怎么走的（默认绕腰/肘）
+
+真网球拍不是绕拍柄底部转的：先转腰带动、击球前一刻肘几乎停住让拍头甩出去、然后随挥再回到
+绕身体转。游戏里也是这么走的——你的手机定拍子**朝向**，握着拍子的手会跟着这个朝向绕腰、
+击球前一刻切到绕肘，最多挪 18cm。按 `G` 可以关掉做对比。
+
+这样做的代价是拍面在挥拍中会平移一小段，不过判定是按整段扫掠算的，命中率没有变化
+（模拟器 396 球 A/B 一致）。**如果手感不对，先按 `G` 关掉，再判断是枢轴还是别的。**
 
 ### 自动走位（默认开）
 
@@ -369,7 +380,7 @@ README 只留操作和手感。下面这些是开发者向的来龙去脉，按�
 | 击球判定为什么必须线段求交、掠射也算接触 | `docs/algorithms.md` 3.5 |
 | 挥拍时拍面中心会甩出去、球为什么不追拍面 | `docs/algorithms.md` 3.6、`docs/history.md` 4.6 |
 | 回球补偿为什么传「归一位姿」、合格池随机挑 | `docs/algorithms.md` 3.7 |
-| WebRTC 双通道、时钟同步、包格式 | `docs/algorithms.md` 3.10 |
+| WebRTC 双通道、时钟同步、包格式 | `docs/algorithms.md` 3.11 |
 | 为什么用 WebRTC 不用 WebSocket、物理为什么在大屏算 | `docs/history.md` 4.1 |
 | 每个手感常量为什么不能乱动 | `docs/tuning.md` 5.1–5.4 |
 | 对打模式：回球机怎么想、几何约束、难度怎么调 | `docs/duel.md` |
@@ -386,7 +397,7 @@ README 只留操作和手感。下面这些是开发者向的来龙去脉，按�
 ## 测试
 
 ```bash
-npm test       # 125 项 / 19 个分组：核心逻辑单测，含对打 13 项、自动走位 15 项（明细见 docs/testing.md）
+npm test       # 140 项 / 22 个分组：核心逻辑单测，含对打 13 项、自动走位 15 项、走位保持 3 项、走位执行 6 项、挥拍枢轴 6 项（明细见 docs/testing.md）
 npm run sim    # 端到端模拟，五档力度 × 6 个种子
 npm run duel-sim # 对打模拟，3 档 × 6 种子 × 60s，带回球机门禁断言
 npm run verify # 全套验证：test ×3 → sim → duel-sim → build；提交前 hook 自动跑快检
@@ -412,7 +423,7 @@ src/
   controller/  手机：传感器采集、环境自检、60Hz 发包
 server/        信令房间 + Vite 插件（证书、局域网 IP）
 scripts/       证书、单测跑手、端到端模拟、verify、probe-* 诊断、git hook
-tests/         core.test.cjs（125 项 / 19 分组）
+tests/         core.test.cjs（140 项 / 22 分组）
 docs/          algorithms / duel / history / tuning / known-issues / testing / motion-accuracy
 AGENTS.md      交接入口：当前状态、取证决策树、文档地图
 ```
@@ -424,4 +435,4 @@ AGENTS.md      交接入口：当前状态、取证决策树、文档地图
 ## 设计取舍
 
 为什么 WebRTC 而不是 WebSocket / 蓝牙、物理为什么在大屏算、连拍为什么等过网才加，
-见 `docs/history.md` 4.1 与 `docs/algorithms.md` 3.8 / 3.10。改之前先读 `AGENTS.md` 第 2 节的 8 条硬约束。
+见 `docs/history.md` 4.1 与 `docs/algorithms.md` 3.8 / 3.11。改之前先读 `AGENTS.md` 第 2 节的 8 条硬约束。

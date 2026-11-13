@@ -4,6 +4,7 @@ import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import type { Quat } from '../core/imu';
 import { type RacketPose } from '../core/racket';
+import { SwingRig } from '../core/swing-rig';
 import type { V3 } from '../core/vec';
 import {
   HALF_WIDTH,
@@ -47,6 +48,43 @@ const TMP_AXIS = new THREE.Vector3();
  */
 export type SceneMode = 'wall' | 'duel';
 
+/**
+ * 相机预设：**相对握点基座**的机位与视点（米）。
+ *
+ * 为什么做成预设而不是一个固定机位：玩家要的东西是互相矛盾的——看得清拍面
+ * 就得贴近，看得见球场和来球就得退开。一张图给不出两个答案，所以给两档，
+ * 按 `Z` 切（`scene.toggleCamera()`）。
+ *
+ * `near` 的取值是按「球拍在画面里的高度占比」定的：握点到相机约 2.2m，
+ * 50° 竖直视角下画面高 2.0m，0.8m 长的拍子占 40%。改之前是 3.9m / 22%——
+ * 拍面在整个画面里只有巴掌大，根本判断不了球会打在框上还是线上。
+ *
+ * 机位摆在握点右后方（+0.45 / +2.35），视点压到击球面前方 1.3m：这样球拍落在
+ * 画面中间偏下、球道在它上方铺开，来球和拍面在同一个视野里。往上抬一点（视点 y
+ * 1.0）会把练习墙顶切掉，往下压一点（1.35）会把蹲下接低球时的拍子切掉——
+ * 1.2 是两头的折中，蹲到握点 0.7m、举到 1.65m 都还在画内。
+ */
+export interface CameraPreset {
+  /** 机位，相对握点基座 (x, z) 的偏移；y 是绝对高度。 */
+  cam: [number, number, number];
+  /** 视点，同上。 */
+  tgt: [number, number, number];
+}
+
+const CAMERA: Record<SceneMode, Record<'near' | 'far', CameraPreset>> = {
+  wall: {
+    // 近景：略偏右后方的过肩位，视点压在击球面稍前方，拍面和来球同时入画
+    near: { cam: [0.45, 1.85, 2.35], tgt: [0.05, 1.2, -1.0] },
+    // 全景：原来的机位，能看见整块半场和练习墙
+    far: { cam: [2.0, 2.3, 3.1], tgt: [0, 1.0, -3.9] },
+  },
+  duel: {
+    // 对打默认要一眼看到两侧底线，所以默认是全景；近景用来盯对手的来球
+    near: { cam: [0, 3.0, 4.3], tgt: [0, 1.05, -3.8] },
+    far: { cam: [0, 4.2, 6.9], tgt: [0, 0.9, -10.8] },
+  },
+};
+
 export interface SceneOptions {
   mode?: SceneMode;
 }
@@ -67,17 +105,36 @@ export class PlayScene {
   private targetQ = new THREE.Quaternion();
   private smoothQ = new THREE.Quaternion();
   /**
-   * 握点 = 球拍 Group 的原点，也是「手」的位置。
+   * 握点**基座** = 走位的目的地，球拍组原点的静止位置。
    *
-   * 走位搬它，手机姿态只改它的**朝向**（`racket.quaternion`）。
-   * 于是拍面中心在挥拍时会绕握点扫出去——这正是真实挥拍的样子，
+   * 走路搬的是它；手机姿态只改朝向；挥拍时 `SwingRig` 再在这个基座上补一段弧，
+   * 让握点绕腰/肘走过去而不是钉在原地转。三者叠起来才是 `RacketPose`——
    * 屏幕上看到的和判定用的是同一个 `position + quaternion`。
-   *
+   */
+  private base = new THREE.Vector3();
+  /** 挥拍枢轴：腰 → 肘 → 腰。见 `core/swing-rig.ts`。 */
+  private rig = new SwingRig();
+  /** `G` 键 / `?rig=0` 关掉枢轴（真机 A/B 用）。 */
+  private rigOn = true;
+  /** 上一帧的平滑姿态，用来量手部角速度（切枢轴要用真实角速度，不能用平滑误差）。 */
+  private lastSmoothQ = new THREE.Quaternion();
+  /** 手部角速度（rad/s），低通一下再喂给枢轴，免得单帧噪声把腰/肘切来切去。 */
+  private spinRad = 0;
+  private camPreset: 'near' | 'far';
+  /**
    * 球按自己的弹道飞，不会在飞行途中被改向去追拍面；喂球只在落地弹起
    * 那一刻瞄一次（`Rally.aimArrival`）。挥拍时拍面扫出去的那段缺口由玩家
    * 自己对准，不再由球补偿。
    */
   private clock = new THREE.Clock();
+  /**
+   * 还没搬完的相机平移量（米）。`setRacketBase` 只往里加，`render` 每帧追一截。
+   *
+   * 为什么不让相机跟基座刚性绑定：那样每一帧的走位修正都会变成整屏平动，
+   * 规划器偶尔改一次主意（4–8cm/帧）看起来就是视野猛抽一下。累积 + 指数追赶
+   * 保住总位移不变（走多远跟多远），只把单帧突变摊薄。
+   */
+  private camLag = new THREE.Vector3();
 
   private fxPool: Fx[] = [];
   private fxFree: Fx[] = [];
@@ -105,18 +162,19 @@ export class PlayScene {
     this.scene.fog = duel ? new THREE.Fog('#f7f7f5', 22, 70) : new THREE.Fog('#f7f7f5', 14, 34);
 
     this.camera = new THREE.PerspectiveCamera(50, 1, 0.05, 120);
-    // 对打要一眼看到两侧底线：相机抬高、后退，视点压到球网附近。
-    if (duel) this.camera.position.set(0, 4.2, 7.2);
-    else this.camera.position.set(2.0, 2.3, 3.4);
+
+    /** 走位给出的握点基座。球拍的实际位置 = 基座 + 挥拍枢轴（`SwingRig`）的弧。 */
+    this.base.set(...RACKET_POS);
 
     this.controls = new OrbitControls(this.camera, canvas);
-    this.controls.target.set(0, duel ? 0.9 : 1.0, duel ? NET_Z : -3.6);
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.08;
     this.controls.minDistance = 1.5;
     this.controls.maxDistance = duel ? 32 : 9;
     this.controls.maxPolarAngle = Math.PI * 0.495;
-    this.controls.update();
+    // 机位由预设决定（见 CAMERA），`Z` 键在两档之间切；鼠标滚轮仍然可以微调
+    this.camPreset = duel ? 'far' : 'near';
+    this.applyCamera();
 
     this.scene.add(new THREE.HemisphereLight('#ffffff', '#d9d5c8', 1.4));
     const key = new THREE.DirectionalLight('#ffffff', 1.7);
@@ -696,7 +754,34 @@ export class PlayScene {
     const k = 1 - Math.exp(-dt / tau);
     this.smoothQ.slerp(this.targetQ, k);
 
-    // 位姿就是「握点 + 手机姿态」：拍面中心挂在 0.6m 的杆子末端，挥拍时随之扫出去。
+    // 手部**真实**角速度：相邻两帧平滑姿态的夹角 / dt。
+    //
+    // 上面那个 `spin` 是「平滑还差多少」，量纲上像角速度但差一个 τ 因子，
+    // 慢速时几乎恒等于 0（平滑早就跟上了）。挥拍枢轴要用它切腰/肘：
+    // 用 `spin` 的话，起势阶段（平滑已经贴住目标、但手真的在转）会被判成
+    // 「没在动」而一直挂在腰上，正好和想要的相反。
+    const rawSpin = this.lastSmoothQ.angleTo(this.smoothQ) / Math.max(dt, 1e-3);
+    this.lastSmoothQ.copy(this.smoothQ);
+    // τ=35ms 的短低通：够快（一次挥拍的中段只有 60–100ms），又能压掉单帧噪声
+    this.spinRad += (Math.min(rawSpin, 80) - this.spinRad) * (1 - Math.exp(-dt / 0.035));
+
+    // 挥拍枢轴：握点从基座上绕腰/肘走一段弧。
+    //
+    // 这一步之前，「挥拍」就是整支拍子绕握点转（拍柄底部当铰链），玩家反馈
+    // 「不像真的挥拍」。现在握点自己也会走弧：慢速（起势、随挥）绕腰，
+    // 快速（击球前一刻的肘部制动）绕肘——两段之间的切换由角速度决定，
+    // 见 `core/swing-rig.ts`。姿态一个字节都没改，改的只是握点去哪。
+    const rigPos = this.rigOn
+      ? this.rig.update(
+          [this.base.x, this.base.y, this.base.z],
+          [this.smoothQ.x, this.smoothQ.y, this.smoothQ.z, this.smoothQ.w],
+          this.spinRad,
+          dt
+        )
+      : [this.base.x, this.base.y, this.base.z];
+    this.racket.position.set(rigPos[0], rigPos[1], rigPos[2]);
+
+    // 位姿就是「握点 + 手机姿态」。握点现在会随挥拍走弧，拍面中心随之扫出去。
     //
     // 曾经为了让「挥拍时球一定在拍面上」把拍面中心锚死在空间里（旋转只改朝向），
     // 但那样屏幕上拍子除了转一点平移都没有，根本不像在挥拍。位置交给握点，
@@ -713,32 +798,95 @@ export class PlayScene {
   }
 
   /**
-   * 移动站位：搬的是**握点**（球拍 Group 的原点）。
+   * 移动站位：搬的是**握点基座**。
    *
    * 只搬位置不动姿态：手机只给得出角度，挪位置是键盘/摇杆的事，
    * 两者必须分开，否则「举着手机往右倾」会同时想改朝向和位置。
+   *
+   * 挥拍那段弧不在这里——它是 `syncRacket` 每帧按姿态算的，基座上不加状态。
    */
   setRacketBase(x: number, y: number, z: number) {
-    const dx = x - this.racket.position.x;
-    const dz = z - this.racket.position.z;
-    this.racket.position.set(x, y, z);
+    const dx = x - this.base.x;
+    const dz = z - this.base.z;
+    this.base.set(x, y, z);
     this.racketGlow.position.set(x, y, z);
     this.hitStrip.position.x = x;
 
-    // 相机跟着平移同样距离。
+    // 相机跟着平移同样距离，但**不在一帧里搬完**。
+    //
     // 人的眼睛长在头上，走位时视野是跟着动的；相机不动的话，往边上走两步
-    // 球拍就出画了，玩家会以为「拍子没了」而不是「我走开了」。
-    // 只平移不转向，环视仍然由鼠标拖动控制，两者互不干扰。
-    if (dx !== 0 || dz !== 0) {
-      this.camera.position.x += dx;
-      this.camera.position.z += dz;
-      this.controls.target.x += dx;
-      this.controls.target.z += dz;
-    }
+    // 球拍就出画了，玩家会以为「拍子没了」而不是「我走开了」。只平移不转向，
+    // 环视仍然由鼠标拖动控制，两者互不干扰。
+    //
+    // 但刚性跟随会把**每一帧的位置修正**都放大成整屏平动：规划器偶尔改一次主意
+    // 就是 4–8cm/帧，画面上是视野猛地一抽（真机反馈的「有时还是会抖」）。
+    // 这里只累积、不立即搬，由 `render` 用 τ=0.12s 追上去——总位移守恒（走多远
+    // 相机就跟多远），单帧的突变被摊成几帧，视觉上是「跟着走」而不是「被拽」。
+    this.camLag.x += dx;
+    this.camLag.z += dz;
+  }
+
+  /** 按当前预设摆机位。机位是相对**基座**的，所以走位之后切档也不会跑到场外。 */
+  private applyCamera() {
+    const p = CAMERA[this.mode][this.camPreset];
+    // 换档是「重新摆机位」，不能还欠着上一段的追赶量，否则会多搬一次
+    this.camLag.set(0, 0, 0);
+    this.camera.position.set(
+      this.base.x + p.cam[0],
+      p.cam[1],
+      this.base.z + p.cam[2]
+    );
+    this.controls.target.set(
+      this.base.x + p.tgt[0],
+      p.tgt[1],
+      this.base.z + p.tgt[2]
+    );
+    this.controls.update();
+  }
+
+  /** `Z` 键：近景 ⇄ 全景。返回切换后的档位，给 HUD 提示用。 */
+  toggleCamera(): 'near' | 'far' {
+    this.camPreset = this.camPreset === 'near' ? 'far' : 'near';
+    this.applyCamera();
+    return this.camPreset;
+  }
+
+  /**
+   * `G` 键 / `?rig=0`：挥拍枢轴开关。
+   *
+   * 关掉之后回到「握点钉死、整支拍子绕拍柄底部转」的老行为。留着这个开关是为了
+   * 真机 A/B——枢轴是**平移**握点，它会不会让人更容易打空，只有手能回答。
+   */
+  setRigEnabled(on: boolean) {
+    this.rigOn = on;
+    if (!on) this.rig.reset();
+  }
+
+  /** 重连 / 换会话：挥拍枢轴的准备姿态必须重新学。 */
+  resetRig() {
+    this.rig.reset();
+    this.lastSmoothQ.copy(this.targetQ);
+    this.spinRad = 0;
   }
 
   render(frameDt?: number) {
     const dt = frameDt ?? this.clock.getDelta();
+
+    // 相机追赶（见 `camLag`）。τ=0.12s：走到位的延迟肉眼看不出，
+    // 但一帧 8cm 的突变会被摊成约 3 帧。残余不足 2mm 就一次搬完，否则会永远差一点。
+    if (this.camLag.x !== 0 || this.camLag.z !== 0) {
+      const k = 1 - Math.exp(-Math.max(dt, 0) / 0.12);
+      let mx = this.camLag.x * k;
+      let mz = this.camLag.z * k;
+      if (Math.abs(this.camLag.x - mx) < 0.002) mx = this.camLag.x;
+      if (Math.abs(this.camLag.z - mz) < 0.002) mz = this.camLag.z;
+      this.camera.position.x += mx;
+      this.camera.position.z += mz;
+      this.controls.target.x += mx;
+      this.controls.target.z += mz;
+      this.camLag.x -= mx;
+      this.camLag.z -= mz;
+    }
 
     // 拖尾：只保留最近 20 个位置
     if (this.trailCount < TRAIL_LEN) {

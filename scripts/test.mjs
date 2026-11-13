@@ -40,6 +40,8 @@ execFileSync(
     'src/core/duel.ts',
     // 自动走位：纯函数（预测 + 限速步进），玩家侧唯一一段能单测的决策逻辑
     'src/core/auto-move.ts',
+    // 挥拍枢轴：纯计算（拍柄方向的最小弧 + 腰/肘混合），不碰 three
+    'src/core/swing-rig.ts',
     'src/play/stats.ts',
     '--outDir',
     out,

@@ -8,7 +8,8 @@ const { LatencyWindow, ClockSync, PacketStats } = require('./play/stats.js');
 const { SwingDetector, shotFromStroke } = require('./core/swing.js');
 const { omegaFromQuatDelta } = require('./core/gyro.js');
 const { makeBall, advance, liftOverNet, aimIntoCourt, setWallActive, predictAtPlane, sampleCrossings } = require('./core/physics.js');
-const { planAutoMove, stepAxis, blendCenterOffset, AUTO_MOVE_DEFAULTS } = require('./core/auto-move.js');
+const { planAutoMove, stepAxis, stepAutoMove, blendCenterOffset, AUTO_MOVE_DEFAULTS, TargetHold } = require('./core/auto-move.js');
+const { SwingRig, SWING_RIG_DEFAULTS } = require('./core/swing-rig.js');
 const { Rally } = require('./core/rally.js');
 const { BallMachine, MACHINE_L2, ARRIVE_Y_MIN, ARRIVE_Y_MAX } = require('./core/machine.js');
 const { Duel } = require('./core/duel.js');
@@ -1804,6 +1805,213 @@ t('握法偏移只在没挥拍的帧采信：挥拍中冻结，静止两秒内�
   assert.deepEqual(off, before, '挥拍中不许改偏移');
 });
 
+console.log('走位目标保持（击球前不再抖）');
+
+/** 造一份「规划器每帧改主意」的 plan：在 z 上隔着 6cm 来回跳，其余不变。 */
+const planAt = (x, z, y = RACKET_POS[1], chasing = true) => ({
+  target: x, targetZ: z, targetY: y, chasing, eta: 0.2, hitY: y, reachable: true,
+});
+
+t('6cm 的来回改主意被吃掉：目标不动，人就不动', () => {
+  // 真机原状：候选平面网格跟着球往前滑，相邻两格的代价差千分之几，
+  // 排序每帧翻一次 → targetZ 在 0.30 / 0.36 之间跳 → 人按 speedZ 满速
+  // 走 6cm 再走回来，60Hz 方波（相机也跟着一起晃）。
+  const hold = new TargetHold();
+  let t = 1000;
+  let z = null;
+  for (let i = 0; i < 60; i++) {
+    const tg = hold.resolve(planAt(0, 0.3 + (i % 2 ? 0.06 : 0)), t);
+    if (z === null) z = tg.z;
+    assert.equal(tg.z, z, `第 ${i} 帧目标被 6cm 的抖动带着跑了`);
+    t += 16.7;
+  }
+  assert.equal(z, 0.3);
+});
+
+t('超过 10cm 就是真的改主意：立刻采纳', () => {
+  const hold = new TargetHold();
+  hold.resolve(planAt(0, 0.3), 1000);
+  const tg = hold.resolve(planAt(0.5, 0.3), 1017);
+  assert.equal(tg.x, 0.5, '换落点了就必须挪');
+});
+
+t('球过去之后先挥完这一拍，250ms 后才回中线', () => {
+  const hold = new TargetHold();
+  // 追低球：握点压到 0.9
+  hold.resolve(planAt(1.2, 0.4, 0.9), 1000);
+  // 球越过拍面：chasing=false，目标变成回中点（y 回 1.3）
+  const a = hold.resolve(planAt(0, HIT_Z, RACKET_POS[1], false), 1030);
+  assert.equal(a.y, 0.9, '刚过去这 30ms 不许回位——那正是挥拍的最后几帧');
+  const b = hold.resolve(planAt(0, HIT_Z, RACKET_POS[1], false), 1200);
+  assert.equal(b.y, 0.9, '250ms 之内仍然保持');
+  const c = hold.resolve(planAt(0, HIT_Z, RACKET_POS[1], false), 1320);
+  assert.equal(c.y, RACKET_POS[1], '超过 250ms 才回中线');
+});
+
+console.log('走位执行（高度两段）');
+
+/** 一份「球在手边」的 plan：只有 eta 和 chasing 影响执行器。 */
+const planWithEta = (eta, chasing = true) => ({
+  target: 0, targetZ: HIT_Z, targetY: RACKET_POS[1],
+  chasing, eta, hitY: 1.5, reachable: true,
+});
+const tgY = (y) => ({ x: 0, y, z: HIT_Z });
+const CUR = { x: 0, y: RACKET_POS[1], z: HIT_Z };
+
+t('球还远（eta 1.2s）时只做预位：一帧只挪一点点，不瞬间到位', () => {
+  const dt = 1 / 60;
+  const next = stepAutoMove(CUR, planWithEta(1.2), tgY(1.65), dt);
+  // 预位速度 1.8 m/s → 一帧 3cm；老行为是 9 m/s（一帧 15cm，看起来就是瞬移）
+  assert.ok(next.y > RACKET_POS[1] && next.y < RACKET_POS[1] + 0.05,
+    `一帧应该只挪 3cm 左右，实际 ${(next.y - RACKET_POS[1]).toFixed(3)}m`);
+});
+
+t('预位幅度就是 ±20cm：球还远时握点不会越过中立位上下 20cm', () => {
+  const dt = 1 / 60;
+  let cur = { ...CUR };
+  for (let i = 0; i < 120; i++) cur = stepAutoMove(cur, planWithEta(1.2), tgY(1.65), dt);
+  assert.ok(Math.abs(cur.y - (RACKET_POS[1] + 0.2)) < 0.03,
+    `高球预位应该停在 ${RACKET_POS[1] + 0.2}，实际 ${cur.y.toFixed(2)}`);
+
+  let low = { ...CUR };
+  for (let i = 0; i < 120; i++) low = stepAutoMove(low, planWithEta(1.2), tgY(0.75), dt);
+  assert.ok(Math.abs(low.y - (RACKET_POS[1] - 0.2)) < 0.03,
+    `低球预位应该停在 ${RACKET_POS[1] - 0.2}，实际 ${low.y.toFixed(2)}`);
+});
+
+t('球到面前（eta → 0）全行程打开：该蹲多深就蹲多深', () => {
+  const dt = 1 / 60;
+  let cur = { ...CUR };
+  for (let i = 0; i < 30; i++) cur = stepAutoMove(cur, planWithEta(0), tgY(0.75), dt);
+  assert.ok(Math.abs(cur.y - 0.75) < 1e-6, `0.5s 之后必须到 0.75，实际 ${cur.y.toFixed(2)}`);
+});
+
+t('预位 → 精确对位是连续开闸，不是到点硬切', () => {
+  // 同一份目标（0.75），eta 从 0.45 一路降到 0：能到的高度必须单调下探，
+  // 而且任何一档都不许越过 0.75。硬切的话 0.45 那一档会突然从 1.10 跳到 0.75，
+  // 目标一帧跳一次、人就反向一次（探针里 y 反向 0.04 次/球）。
+  const dt = 1 / 60;
+  const settle = (eta) => {
+    let cur = { ...CUR };
+    for (let i = 0; i < 200; i++) cur = stepAutoMove(cur, planWithEta(eta), tgY(0.75), dt);
+    return cur.y;
+  };
+  const y045 = settle(0.45);
+  const y030 = settle(0.3);
+  const y015 = settle(0.15);
+  const y000 = settle(0);
+  assert.ok(y045 > y030 && y030 > y015 && y015 > y000,
+    `应该单调下探，实际 ${[y045, y030, y015, y000].map((v) => v.toFixed(2)).join(' > ')}`);
+  assert.ok(Math.abs(y045 - (RACKET_POS[1] - 0.2)) < 0.03,
+    `球还远（eta=0.45）时应该停在预位下沿附近，实际 ${y045.toFixed(2)}`);
+  assert.ok(y000 < RACKET_POS[1] - 0.4, `球到面时应该蹲得比预位深得多，实际 ${y000.toFixed(2)}`);
+});
+
+t('球已经过去：回位用 homeSpeed，不是 9 m/s 的竖直弹跳', () => {
+  const dt = 1 / 60;
+  const next = stepAutoMove({ x: 0, y: 0.75, z: HIT_Z }, planWithEta(null, false), tgY(RACKET_POS[1]), dt);
+  // 3.2 m/s → 一帧 5.3cm；9 m/s 是 15cm，正好落在挥拍最后两帧上
+  assert.ok(next.y - 0.75 < 0.06, `回位一帧 ${(next.y - 0.75).toFixed(3)}m 太快`);
+});
+
+t('横移 / 前后 / 高度三轴各自限速，边界夹得住', () => {
+  const dt = 1 / 60;
+  const plan = planWithEta(0.5);
+  const next = stepAutoMove({ x: 0, y: RACKET_POS[1], z: HIT_Z }, plan,
+    { x: 9, y: 1.65, z: 9 }, dt);
+  assert.ok(next.x - 0 <= AUTO_MOVE_DEFAULTS.speed * dt + 1e-9, `x 超速 ${next.x}`);
+  assert.ok(next.z - HIT_Z <= AUTO_MOVE_DEFAULTS.speedZ * dt + 1e-9, `z 超速 ${next.z}`);
+  assert.ok(next.x <= AUTO_MOVE_DEFAULTS.maxX + 1e-9, 'x 出了边线');
+  assert.ok(next.z <= AUTO_MOVE_DEFAULTS.maxZ + 1e-9, 'z 出了纵深');
+  assert.ok(next.y <= AUTO_MOVE_DEFAULTS.maxGripY + 1e-9, '高度越过上限');
+});
+
+console.log('挥拍枢轴（腰 → 肘 → 腰）');
+
+const BASE = [0, RACKET_POS[1], HIT_Z];
+const IDENT = [0, 0, 0, 1];
+/** 绕世界 x 轴转角 a 的四元数：拍柄从竖直往前压，正手挥拍的标准动作。 */
+const tiltX = (a) => [Math.sin(a / 2), 0, 0, Math.cos(a / 2)];
+const dist3 = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+
+t('静止 / 姿态没变 → 握点就是基座，一点都不动', () => {
+  const rig = new SwingRig();
+  for (let i = 0; i < 30; i++) {
+    const p = rig.update(BASE, IDENT, 0, 1 / 60);
+    assert.ok(dist3(p, BASE) < 1e-9, `第 ${i} 帧动了 ${dist3(p, BASE)}`);
+  }
+});
+
+t('原地翻腕（绕拍柄轴自转）不该让握点跑掉', () => {
+  // 这是这一层最关键的判据：姿态增量里手腕自转可以很大，但手心转一下只是
+  // 拍子原地翻面。用拍柄方向的**最小弧**做枢轴旋转，自转对它是零。
+  const rig = new SwingRig();
+  rig.update(BASE, IDENT, 0, 1 / 60);
+  const roll = [0, Math.sin(Math.PI / 4), 0, Math.cos(Math.PI / 4)]; // 绕自身 y 轴 90°
+  const p = rig.update(BASE, roll, 3, 1 / 60);
+  assert.ok(dist3(p, BASE) < 1e-6, `翻腕把握点搬走了 ${dist3(p, BASE).toFixed(3)}m`);
+});
+
+t('拍柄往前压 40°：握点朝击球方向走一段弧，且不超过位移上限', () => {
+  const rig = new SwingRig();
+  rig.update(BASE, IDENT, 0, 1 / 60);
+  // 慢速 → 绕腰。角度取负：绕 +x 转是拍柄朝 +z（身后）倒，绕 -x 才是往前压
+  const p = rig.update(BASE, tiltX(-0.7), 2, 1 / 60);
+  assert.ok(p[2] < BASE[2] - 0.05, `应该往 -z（球那边）走，实际 dz ${(p[2] - BASE[2]).toFixed(3)}`);
+  assert.ok(p[1] < BASE[1], '绕腰往前压，握点应该同时下沉');
+  assert.ok(dist3(p, BASE) <= SWING_RIG_DEFAULTS.maxShift + 1e-9,
+    `位移 ${dist3(p, BASE).toFixed(3)} 越过了上限 ${SWING_RIG_DEFAULTS.maxShift}`);
+
+  // 大挥：位移一定被限住，否则拍面会被搬出判定位（喂球是瞄挥拍前那个位置的）
+  const big = rig.update(BASE, tiltX(-2.0), 2, 1 / 60);
+  assert.ok(dist3(big, BASE) <= SWING_RIG_DEFAULTS.maxShift + 1e-9,
+    `114° 时位移 ${dist3(big, BASE).toFixed(3)} 应该被夹到 ${SWING_RIG_DEFAULTS.maxShift}`);
+});
+
+t('同一条挥拍动作，慢挥绕腰、快挥绕肘（手几乎停住，拍头甩出去）', () => {
+  // 两段完全一样的拍柄轨迹，只有手部角速度不同：2 rad/s（转体带动）对 25 rad/s（肘部制动）。
+  // 转角走 0 → 0.3 rad，远在位移上限之内，这样才能比较「同样转一点、手握点走多远」。
+  const run = (spin) => {
+    const rig = new SwingRig();
+    rig.update(BASE, IDENT, 0, 1 / 60);
+    let p = BASE;
+    for (let i = 1; i <= 24; i++) p = rig.update(BASE, tiltX(-0.3 * (i / 24)), spin, 1 / 60);
+    return { p, r: dist3(rig.pivot, BASE) };
+  };
+  const slow = run(2);
+  const fast = run(25);
+
+  assert.ok(slow.r > fast.r + 0.1, `腰的半径 ${slow.r.toFixed(3)} 应该明显大于肘的 ${fast.r.toFixed(3)}`);
+  assert.ok(dist3(slow.p, BASE) > dist3(fast.p, BASE) * 1.4,
+    `慢挥握点应该走得远得多：腰 ${dist3(slow.p, BASE).toFixed(3)} vs 肘 ${dist3(fast.p, BASE).toFixed(3)}`);
+});
+
+t('枢轴在两个门限之间连续切换，握点不跳', () => {
+  const rig = new SwingRig();
+  rig.update(BASE, IDENT, 0, 1 / 60);
+  // 先走一帧让「零位移」的那一帧过去（第一帧从基座跳到弧上不算跳变）
+  let prev = rig.update(BASE, tiltX(-0.6), 15, 1 / 60);
+  let worst = 0;
+  for (let i = 0; i < 120; i++) {
+    // 角速度在 0 → 30 rad/s 之间扫一圈，正好穿过 slowSpin/fastSpin
+    const spin = 15 + 15 * Math.sin((i / 120) * Math.PI * 2);
+    const p = rig.update(BASE, tiltX(-0.6), spin, 1 / 60);
+    worst = Math.max(worst, dist3(p, prev));
+    prev = p;
+  }
+  assert.ok(worst < 0.03, `单帧最大跳变 ${worst.toFixed(3)}m，枢轴切换必须连续`);
+});
+
+t('reset 之后重新学准备姿态：不带着上一段的弧', () => {
+  const rig = new SwingRig();
+  rig.update(BASE, IDENT, 0, 1 / 60);
+  rig.update(BASE, tiltX(0.8), 5, 1 / 60);
+  rig.reset();
+  // 新会话第一帧：姿态是「挥到一半」的那个，但没有基准 → 不该凭空带弧
+  const p = rig.update(BASE, tiltX(0.8), 0, 1 / 60);
+  assert.ok(dist3(p, BASE) < 1e-9, `reset 后第一帧动了 ${dist3(p, BASE).toFixed(3)}m`);
+});
+
 t('端到端：中途跑开 2.2m，自动走位仍把球拉回判定位内', () => {
   // 墙打的球是瞄着「发球那一刻的拍面」来的，落地重瞄只能横移 20cm。
   // 玩家中途按错方向跑到边上，球就不会来找他了——这是「够不到」的典型现场。
@@ -1821,16 +2029,20 @@ t('端到端：中途跑开 2.2m，自动走位仍把球拉回判定位内', () 
     let px = 0;
     let pz = HIT_Z;
     const devs = [];
+    // 和 `app.ts` 同一套：规划 → `TargetHold`（目标保持 10cm）→ 限速步进。
+    // 少了保持器的话，规划器每帧在相邻候选平面之间改主意，人会跟着抖。
+    const hold = new TargetHold();
     for (let i = 0; i < 60 * 32; i++) {
       now += dt * 1000;
       if (i === 40) px = 2.2; // 跑开，此后完全交给自动走位
       const plan = planAutoMove(r.ball, { x: px, z: pz, center: [0, FACE_CY, 0] });
+      const tg = hold.resolve(plan, now);
       const speed = plan.chasing ? AUTO_MOVE_DEFAULTS.speed : AUTO_MOVE_DEFAULTS.homeSpeed;
       const speedZ = plan.chasing ? AUTO_MOVE_DEFAULTS.speedZ : AUTO_MOVE_DEFAULTS.homeSpeed;
       px = Math.max(-AUTO_MOVE_DEFAULTS.maxX,
-        Math.min(AUTO_MOVE_DEFAULTS.maxX, stepAxis(px, plan.target, speed * dt, AUTO_MOVE_DEFAULTS.deadband)));
+        Math.min(AUTO_MOVE_DEFAULTS.maxX, stepAxis(px, tg.x, speed * dt, AUTO_MOVE_DEFAULTS.deadband)));
       pz = Math.max(AUTO_MOVE_DEFAULTS.minZ,
-        Math.min(AUTO_MOVE_DEFAULTS.maxZ, stepAxis(pz, plan.targetZ, speedZ * dt, AUTO_MOVE_DEFAULTS.deadband)));
+        Math.min(AUTO_MOVE_DEFAULTS.maxZ, stepAxis(pz, tg.z, speedZ * dt, AUTO_MOVE_DEFAULTS.deadband)));
       r.pushRacket({ t: now, pos: [px, RACKET_POS[1], pz], q: [0, 0, 0, 1] });
       // 球穿过**这一帧的**站位平面那一刻，量球心与握点的横向差（竖握 = 与拍面中心的差）
       const prevZ = r.ball.p[2];

@@ -34,6 +34,8 @@ execFileSync(
     'src/core/rally.ts',
     // 自动走位：`scripts/sim-e2e.cjs` 用 MOVE=auto 对比「自动走位 vs 人站着不动」
     'src/core/auto-move.ts',
+    // 挥拍枢轴：sim 的 A/B（有弧 vs 无弧）要在同一套物理里跑
+    'src/core/swing-rig.ts',
     '--outDir',
     out,
     '--rootDir',

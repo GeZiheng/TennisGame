@@ -49,8 +49,14 @@ function probeHints() {
   if (hits('physics', 'court', 'feed')) {
     hints.push('  涉及喂球 / 弹道 → node scripts/probe-feed.cjs、node scripts/probe-feed-scan2.cjs');
   }
-  if (hits('racket', 'swing', 'rally')) {
+  if (hits('racket', 'swing', 'rally', 'swing-rig')) {
     hints.push('  涉及挥拍 / 判定 → node scripts/probe-swing.cjs、node scripts/probe-geom.cjs');
+  }
+  if (hits('auto-move', 'swing-rig', 'scene')) {
+    hints.push('  涉及走位 / 挥拍枢轴 → GRIP=horiz node scripts/probe-jitter.cjs（反向次数应为 0）、RIG=1 npm run sim');
+  }
+  if (hits('auto-move', 'rally')) {
+    hints.push('  涉及瞄准点 / 喂球 → node scripts/probe-contact.cjs 与 MODE=contact（瞄准误差应 <0.05m）');
   }
   return hints;
 }

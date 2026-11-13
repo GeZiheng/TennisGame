@@ -18,7 +18,9 @@ import {
   AUTO_MOVE_DEFAULTS,
   blendCenterOffset,
   planAutoMove,
+  stepAutoMove,
   stepAxis,
+  TargetHold,
   type AutoMoveState,
 } from '../core/auto-move';
 import { MockController } from './mock';
@@ -97,27 +99,116 @@ const room = (qs.get('room') ?? randomRoom()).toUpperCase().slice(0, 4);
 let autoMove = qs.get('auto') !== '0';
 
 /**
- * 拍面中心相对**握点**的偏移（世界系，长度恒为 `FACE_CY`=0.6）。
+ * 挥拍枢轴（`core/swing-rig.ts`）：默认开，`?rig=0` 关，`G` 键切。
+ *
+ * 它把握点从「钉在原地」改成「绕腰/肘走一段弧」，所以拍面中心在挥拍中会平移
+ * 最多 0.18m（`maxShift`）。判定是扫掠的、位移也限了幅，模拟器 A/B 里命中率
+ * 没有变化（`RIG=1 node scripts/sim-e2e.cjs`），但「手感对不对」只有真机能回答。
+ */
+let rigOn = qs.get('rig') !== '0';
+
+/**
+ * 瞄准点学习（11-14 晚）：默认开，`?aim=rest` 关掉（回到「瞄站着不动的拍面」）。
+ *
+ * 留这个开关是因为它改的是**喂球瞄哪儿**，不只是走位：关掉之后球会飞回老地方，
+ * 真机 A/B 才有对照组。没有绑键位——它是「这一局怎么打」的选择，不是临场动作。
+ */
+let aimLearn = qs.get('aim') !== 'rest';
+
+/**
+ * 拍面中心相对**基座**（走位用的那个握点）的偏移（世界系，长度恒为 `FACE_CY`=0.6）。
  *
  * 自动走位要的是「拍面中心对准球」，不是「握点对准球」。这两者只在拍子竖直握时重
  * 合：握法一横，拍面就在握点侧方 0.6m，而判定半轴只有 0.24m —— 站对了也打空。
  *
- * 不能直接用实时 `faceCenter`：挥拍本身把中心甩出 0.3–1.1m，每帧跟着走就是「一挥拍
- * 人被拽着跑」（`docs/history.md` 4.5 的老问题）。所以只在角速度很低的帧采信，
- * 用 τ=0.4s 低通跟踪**握法**造成的静态偏移；挥拍期间冻结。
+ * 这里有两份偏移，加起来才是走位该瞄的那个点：
+ *
+ * 1. `restOffset` —— **站着不动时的握法偏移**。不能直接用实时 `faceCenter`：
+ *    挥拍本身把中心甩出 0.3–1.1m，每帧跟着走就是「一挥拍人被拽着跑」
+ *    （`docs/history.md` 4.5 的老问题）。所以只在角速度 < 1.2 rad/s 的帧采信，
+ *    τ=0.3s 一阶跟踪。门限 0.6 → 1.2 是 11-14 放宽的：0.6 rad/s（34°/s）连
+ *    正常的手部微动都会挡掉，估出来的握法会**卡在开局那一次**，于是「站多远」
+ *    一直按老姿势算（真机反馈「走位没控制好与球的水平距离」）。1.2 rad/s
+ *    （69°/s）仍远低于真实挥拍（100–1700°/s）。
+ * 2. `contactDelta` —— **挥下去那一刻**拍面比站着时多扫出去的那一段，每命中一球
+ *    学一次（`learnContact`）。挥拍 40–80° 会把中心扫出 40–60cm，比判定盘还宽；
+ *    不补这一段，走位瞄的就是「我站着不动时的拍面」。
+ *
+ * 两份偏移都必须**同时**喂给走位（`planAutoMove`）和喂球（`Rally.setFaceAimOffset`）：
+ * 只改一边的话，球会被瞄到另一个点上，而且每球累积一次，人会一路被推到边界
+ * （`docs/history.md` 4.23）。
  */
-const centerOffset: [number, number, number] = [0, FACE_CY, 0];
+const restOffset: [number, number, number] = [0, FACE_CY, 0];
+/** 平滑后的「击球瞬间 − 站着不动」偏移，逐帧朝 `contactWant` 收敛。 */
+const contactDelta: [number, number, number] = [0, 0, 0];
+/** 上一拍学到的目标值。只在新命中时更新，所以两拍之间是一条直线。 */
+const contactWant: [number, number, number] = [0, 0, 0];
+/** 走位与喂球共用的瞄准偏移 = `restOffset + contactDelta`。 */
+const planOffset: [number, number, number] = [0, FACE_CY, 0];
+/** 学到的样本数：0 表示还没命中过，此时 `planOffset` 就是老行为。 */
+let contactSamples = 0;
+/** 连续没打到的球数。用来在「学歪了」时自动退回老行为，见 `noteMiss`。 */
+let missStreak = 0;
 let prevQ: [number, number, number, number] | null = null;
+
+const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
 function updateCenterOffset(pose: ReturnType<PlayScene['syncRacket']>, dt: number) {
   const fc = faceCenter(pose);
   const want: [number, number, number] = [
-    fc[0] - pose.pos[0],
-    fc[1] - pose.pos[1],
-    fc[2] - pose.pos[2],
+    fc[0] - PLAYER.x,
+    fc[1] - PLAYER.y,
+    fc[2] - PLAYER.z,
   ];
-  if (prevQ) blendCenterOffset(prevQ, pose.q, dt, want, centerOffset);
+  if (prevQ) blendCenterOffset(prevQ, pose.q, dt, want, restOffset, 1.2, 0.3);
   prevQ = [pose.q[0], pose.q[1], pose.q[2], pose.q[3]];
+
+  // 学到的补偿不要在两拍之间跳：命中那一刻只有一个样本，逐帧收敛（τ=0.45s）
+  const k = 1 - Math.exp(-Math.max(dt, 0) / 0.45);
+  for (let i = 0; i < 3; i++) {
+    contactDelta[i] += (contactWant[i] - contactDelta[i]) * k;
+    planOffset[i] = restOffset[i] + contactDelta[i];
+  }
+  // 喂球必须用同一份偏移（见上）。对打的来球是对手回球机打的，不看玩家拍面，
+  // 所以只有墙打需要同步。
+  if (game instanceof Rally) game.setFaceAimOffset(planOffset);
+}
+
+/**
+ * 连续漏接的兜底：学到的偏移可能把人带进「怎么打都打不到」的死角
+ * （换握法、换了挥拍幅度、或者干脆没在挥），而**没命中就不学**，于是永远出不来。
+ *
+ * 连丢三球之后每球把 `contactWant` 缩 30%：它是在往回退到 `restOffset`，也就是
+ * 「瞄站着不动的拍面」这个老行为——那个至少不会系统性偏半个拍面。
+ * 只要打中一球就清零重来，所以正常的球不会触发。
+ */
+function noteMiss() {
+  if (!aimLearn) return;
+  missStreak++;
+  if (missStreak < 3) return;
+  for (let i = 0; i < 3; i++) contactWant[i] *= 0.7;
+}
+
+/**
+ * 这一拍命中时，记下「拍面中心真的扫到了哪儿」，作为下一拍的瞄准点。
+ *
+ * 它和 `restOffset` 的差就是挥拍带来的那一段：横握绕横轴压拍 30° 就是 35cm 横向
+ * + 50cm 纵深，竖握主要是纵深和高度。每一拍重学一次（EMA 0.45），玩家换握法 /
+ * 换挥拍幅度都会自己跟上。
+ *
+ * **只在命中时学**：没碰到球的姿态不能代表「击球那一刻」，学进去会把瞄准点越带越偏。
+ */
+function learnContact(pose: ReturnType<PlayScene['syncRacket']>) {
+  if (!aimLearn) return;
+  const fc = faceCenter(pose);
+  const want = [fc[0] - PLAYER.x, fc[1] - PLAYER.y, fc[2] - PLAYER.z];
+  const k = contactSamples === 0 ? 1 : 0.45;
+  for (let i = 0; i < 3; i++) {
+    // 单轴夹到 ±0.55m：0.6 的杆子再转也就这么大，超出去说明这一拍不是正常击球
+    contactWant[i] = clamp(contactWant[i] + (clamp(want[i] - restOffset[i], -0.55, 0.55) - contactWant[i]) * k, -0.55, 0.55);
+  }
+  contactSamples++;
+  missStreak = 0;
 }
 
 /* ---------------- 连接面板 ---------------- */
@@ -208,6 +299,25 @@ function resetSession() {
   peakG = 0;
   peakW = 0;
   game.reset();
+  targetHold.reset();
+  // 挥拍枢轴的准备姿态是「上一次挥拍之后学到的握法」，换会话必须重学，
+  // 否则新会话第一帧就会凭空带一段弧。
+  scene.resetRig();
+  // 握法偏移、击球偏移也一样：新会话第一帧没有可信的姿态基准，重新从「竖直握
+  // → 拍面在正上方」起步（和 `restOffset` 的初值一致），别带着上一场的学到的量。
+  prevQ = null;
+  contactSamples = 0;
+  missStreak = 0;
+  for (let i = 0; i < 3; i++) {
+    contactWant[i] = 0;
+    contactDelta[i] = 0;
+  }
+  restOffset[0] = 0;
+  restOffset[1] = FACE_CY;
+  restOffset[2] = 0;
+  planOffset[0] = 0;
+  planOffset[1] = FACE_CY;
+  planOffset[2] = 0;
   flashHint('手机已接入 · 会话已重置');
 }
 
@@ -285,6 +395,8 @@ function secondaryText(): string {
 function handle(e: RallyEvent | DuelEvent) {
   switch (e.kind) {
     case 'hit': {
+      // 命中那一刻的拍面姿态 = 下一拍该瞄的地方。见 `learnContact`。
+      if (lastPose && (!('by' in e) || e.by === 'player')) learnContact(lastPose);
       if ('by' in e) {
         // 对打：谁打的要区分——对手那一拍音效压低一点，否则听不出回合归属
         sfx.hit(e.by === 'player' ? 0.7 : 0.4, e.clean);
@@ -314,6 +426,7 @@ function handle(e: RallyEvent | DuelEvent) {
       sfx.wall(e.speed);
       break;
     case 'net':
+      if (!('by' in e) || e.by === 'player') noteMiss();
       sfx.net();
       break;
     case 'out':
@@ -323,6 +436,8 @@ function handle(e: RallyEvent | DuelEvent) {
       }
       break;
     case 'miss':
+      // 对打里对手漏接也会走到这里，只有玩家的漏接能说明「瞄准学歪了」
+      if (!('by' in e) || e.by === 'player') noteMiss();
       flashHint(e.reason === 'reach' ? '够不着，球从身边过去了' : '挥晚了');
       break;
     case 'streak':
@@ -633,6 +748,9 @@ const PLAYER = {
   maxY: AUTO_MOVE_DEFAULTS.maxGripY,
 };
 
+/** 自动走位的目标保持器。跨帧状态，和 `PLAYER` 一起在会话重置时清掉。 */
+const targetHold = new TargetHold();
+
 const held = new Set<string>();
 
 function updatePlayer(dt: number) {
@@ -665,16 +783,17 @@ function updatePlayer(dt: number) {
   // x 补偿握法偏移（横握时中心在握点侧方半米），z 决定「球到面时的高度」——
   // 只调 x 的话，球高了低了都只能干看着。
   const cfg = AUTO_MOVE_DEFAULTS;
-  const state: AutoMoveState = { x: PLAYER.x, y: PLAYER.y, z: PLAYER.z, center: centerOffset };
+  const state: AutoMoveState = { x: PLAYER.x, y: PLAYER.y, z: PLAYER.z, center: planOffset };
   const plan = planAutoMove(game.ball, state, cfg);
-  const speed = plan.chasing ? cfg.speed : cfg.homeSpeed;
-  const speedZ = plan.chasing ? cfg.speedZ : cfg.homeSpeed;
-  PLAYER.x = Math.min(PLAYER.maxX, Math.max(-PLAYER.maxX, stepAxis(PLAYER.x, plan.target, speed * dt, cfg.deadband)));
-  PLAYER.z = Math.min(PLAYER.maxZ, Math.max(PLAYER.minZ, stepAxis(PLAYER.z, plan.targetZ, speedZ * dt, cfg.deadband)));
-  // 高度这一维**永远**按 speedY 走，不跟 chasing 挂钩：回位时要站起来，
-  // 追球时要蹲下去，两件事都必须是「立刻到位」。
-  PLAYER.y = Math.min(PLAYER.maxY, Math.max(PLAYER.minY,
-    stepAxis(PLAYER.y, plan.targetY, cfg.speedY * dt, cfg.deadband)));
+  // 规划器每帧重选平面，相邻候选的代价几乎相等时会来回跳 6cm——那就是
+  // 「击球前拍子抖一下」。保持器把 10cm 以内的改主意吃掉，见 `TargetHold`。
+  const tg = targetHold.resolve(plan, performance.now());
+  // 限速步进 + 边界 + 高度两段（预位 / 精确对位）都在 `stepAutoMove` 里，
+  // 探针跑的是同一个函数——见 `docs/testing.md` 8.4 那条「别在探针里再抄一份」。
+  const next = stepAutoMove(PLAYER, plan, tg, dt, cfg);
+  PLAYER.x = next.x;
+  PLAYER.y = next.y;
+  PLAYER.z = next.z;
   scene.setRacketBase(PLAYER.x, PLAYER.y, PLAYER.z);
 }
 
@@ -752,6 +871,16 @@ addEventListener('keydown', (e) => {
     flashHint(sfx.isMuted ? '静音' : '已开启声音');
   }
   if (k === 'c') game.reset();
+  if (k === 'g') {
+    rigOn = !rigOn;
+    scene.setRigEnabled(rigOn);
+    flashHint(rigOn ? '挥拍枢轴：开（绕腰/肘）' : '挥拍枢轴：关（绕拍柄底部）');
+  }
+  if (k === 'z') {
+    // 近景/全景：判断「球打在框上还是线上」要贴近，看整场要退开，一张图给不了两个答案
+    const p = scene.toggleCamera();
+    flashHint(p === 'near' ? '近景 · 看得清拍面' : '全景 · 看得见来球');
+  }
   if (k === 'f') {
     autoMove = !autoMove;
     flashHint(autoMove ? '自动走位已开：只要挥拍' : '自动走位已关：A/D 手动跑位');
@@ -779,6 +908,7 @@ addEventListener('beforeunload', () => {
  */
 export function startPlay(mode: SceneMode) {
   scene = new PlayScene(canvas, { mode });
+  scene.setRigEnabled(rigOn);
   game = mode === 'duel' ? new Duel(liveStroke) : new Rally(liveStroke);
 
   document.title = mode === 'duel' ? '网球体感 P1 · 对打（脚本回球机）' : '网球体感 P1 · 对墙打';

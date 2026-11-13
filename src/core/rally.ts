@@ -159,6 +159,23 @@ export class Rally {
   private aimDy = 0;
 
   /**
+   * 喂球瞄准时用的「拍面中心相对握点」的偏移；`null` = 用当前位姿的真实拍面中心。
+   *
+   * 为什么需要它：走位和喂球必须瞄**同一个**拍面位置，否则会多出一个固定差，
+   * 而且会**每球累积一次**——走位按偏移 A 站，球按偏移 B 瞄，下一球拍面又在
+   * 新的位置上被瞄一次，人就被一路推着走到边界（`docs/history.md` 4.23）。
+   *
+   * 大屏端会传「击球那一刻的拍面偏移」（挥拍会把中心扫出去几十厘米），
+   * 于是球被瞄向「我挥下去时拍面会在的地方」，而不是「我站着不动时拍面的地方」。
+   */
+  private faceAim: V3 | null = null;
+
+  /** 换球拍偏移（`null` 恢复成用真实拍面中心）。见 `faceAim`。 */
+  setFaceAimOffset(v: V3 | null) {
+    this.faceAim = v ? [v[0], v[1], v[2]] : null;
+  }
+
+  /**
    * @param liveStroke 抢跑取拍。球已经停在击球面上时，直接向检测器要一份
    *   「正在进行中」的挥拍快照。由大屏端注入，因为检测器不在 core 层。
    *
@@ -509,7 +526,11 @@ export class Rally {
     if (this.arrivalAimed) return;
     const pose = this.rackets.last;
     if (!pose) return;
-    const face = faceCenter(pose);
+    // 瞄哪儿由大屏端决定：它知道「挥拍会把拍面中心扫到哪」（`faceAim`）。
+    // 没传就是老行为——瞄这一帧的真实拍面中心。
+    const face: V3 = this.faceAim
+      ? [pose.pos[0] + this.faceAim[0], pose.pos[1] + this.faceAim[1], pose.pos[2] + this.faceAim[2]]
+      : faceCenter(pose);
     const b = this.ball;
     const vz = b.v[2];
     if (vz <= 0.4) return;

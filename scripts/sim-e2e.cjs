@@ -16,6 +16,7 @@ const { HIT_Z, RACKET_POS } = require('../.tmp-sim/core/court.js');
 const { faceCenter } = require('../.tmp-sim/core/racket.js');
 const { makeBall, advance } = require('../.tmp-sim/core/physics.js');
 const { planAutoMove, stepAxis, AUTO_MOVE_DEFAULTS } = require('../.tmp-sim/core/auto-move.js');
+const { SwingRig, SWING_RIG_DEFAULTS } = require('../.tmp-sim/core/swing-rig.js');
 const { FACE_CY } = require('../.tmp-sim/core/court.js');
 
 /**
@@ -28,6 +29,18 @@ const { FACE_CY } = require('../.tmp-sim/core/court.js');
  *            也就是自动走位这个功能存在的理由。
  */
 const MOVE = process.env.MOVE ?? 'naive';
+
+/**
+ * 挥拍枢轴 A/B：`RIG=1` 时按 `src/core/swing-rig.ts` 给握点补上那段弧
+ * （慢速绕腰、快速绕肘），`RIG=0`（默认）就是老的「握点钉死、整支拍子绕拍柄转」。
+ *
+ * 为什么要在模拟器里做这个 A/B：枢轴会**平移**握点，也就是平移拍面中心，
+ * 而喂球是瞄着挥拍前那个拍面位置的。判定虽然是扫掠的，但「拍面被搬走 15cm
+ * 之后还打不打得中」不能用推理代替——这里跑的是同一套物理与碰撞。
+ */
+const RIG = process.env.RIG === '1';
+const RIG_GAIN = Number(process.env.RIG_GAIN ?? 0.4);
+const RIG_SHIFT = Number(process.env.RIG_SHIFT ?? SWING_RIG_DEFAULTS.maxShift);
 
 /**
  * 「球还有多久到拍面」——直接拿物理往前推，而不是按当前速度外推。
@@ -146,6 +159,10 @@ function run({ peakW, label, seed }) {
   const SPEED = 5.5; // m/s，接近职业球员的横移冲刺
 
   const stats = { hits: 0, misses: 0, nets: 0, ends: 0, serves: 0, swings: 0, trace: [] };
+  const rig = new SwingRig();
+  const rigCfg = { ...SWING_RIG_DEFAULTS, gain: RIG_GAIN, maxShift: RIG_SHIFT };
+  /** 这一帧的握点。`RIG` 关时就是基座本身。 */
+  let pos = [0, RACKET_POS[1], HIT_Z];
 
   // 本局随机源：只影响发球横向扰动
   const rng = makeRng(seed);
@@ -225,7 +242,12 @@ function run({ peakW, label, seed }) {
         racketX += Math.max(-step, Math.min(step, aim - racketX));
       }
       // 位姿 = 握点 + 朝向。拍面中心随之绕握点扫动，这是真实的挥拍几何。
-      r.pushRacket({ t: now, pos: [racketX, RACKET_POS[1], HIT_Z], q: qSwing });
+      // 开了 RIG 之后握点自己也会绕腰/肘走一段弧（见 swing-rig.ts），
+      // 位姿的**两个**分量都交给它算，渲染和判定看到的仍然是同一份。
+      pos = RIG
+        ? rig.update([racketX, RACKET_POS[1], HIT_Z], qSwing, held, dt / 1000, rigCfg)
+        : [racketX, RACKET_POS[1], HIT_Z];
+      r.pushRacket({ t: now, pos, q: qSwing });
 
       // ---- 3. 走检测器（每帧都喂，模拟 60Hz 发包）----
       const stroke = det.push({ t: now, omega: [held, 0, 0], q: qSwing });
@@ -242,7 +264,7 @@ function run({ peakW, label, seed }) {
           if (stats.trace.length < 4) {
             stats.trace.push(
               `${e.reason} 球=(${r.ball.p.map((v) => v.toFixed(2)).join(',')}) ` +
-                `拍心=(${faceCenter({ t: now, pos: [racketX, RACKET_POS[1], HIT_Z], q: qSwing }).map((v) => v.toFixed(2)).join(',')}) 转角${deg.toFixed(0)}° ` +
+                `拍心=(${faceCenter({ t: now, pos, q: qSwing }).map((v) => v.toFixed(2)).join(',')}) 转角${deg.toFixed(0)}° ` +
                 `v=(${r.ball.v.map((x) => x.toFixed(1)).join(',')}) ` +
                 `lag=${r.diag.lastLag === null ? 'null' : Math.round(r.diag.lastLag)}`
             );
@@ -267,7 +289,10 @@ function run({ peakW, label, seed }) {
   return ok;
 }
 
-console.log(`端到端：60Hz 发包 + 30Hz 姿态（平台段输入），走位=${MOVE}，每档多个种子\n`);
+console.log(
+  `端到端：60Hz 发包 + 30Hz 姿态（平台段输入），走位=${MOVE}，` +
+    `挥拍枢轴=${RIG ? `开（gain ${RIG_GAIN}，位移限 ${RIG_SHIFT}m）` : '关'}，每档多个种子\n`
+);
 const cases = [
   { peakW: 5.5, label: '轻挥（刚过门槛）' },
   { peakW: 8, label: '中力' },

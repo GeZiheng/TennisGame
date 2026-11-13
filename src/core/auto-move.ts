@@ -60,10 +60,30 @@ export interface AutoMoveConfig {
    * 这一维要「立刻到位」，否则球到面时拍面还在半路上，等于没这一维。
    */
   speedY: number;
+  /**
+   * 球还远时的握点升降速度（m/s）。这一档只用来做「预位」：把拍子朝来球的高度
+   * 提前抬/压 `heightBand`，慢到看得见。老行为是全程 `speedY`=9 m/s，一帧 15cm，
+   * 抬起来是一瞬间、球一过又弹回中立位，玩家只看到「永远同一个高度」。
+   */
+  speedYSlow: number;
+  /** 预位幅度（米）：球还远时握点最多偏离中立高度这么多。 */
+  heightBand: number;
+  /**
+   * 「球还远」的判据（秒）：`plan.eta` 大于它就只做预位，小于它才放开整个
+   * `minGripY–maxGripY` 行程做精确对位。
+   */
+  heightLead: number;
   /** 没有来球时回中线的速度（m/s）。比追球慢，免得球刚离拍人就窜回去。 */
   homeSpeed: number;
   /** 目标死区（米）。差得比这还少就不动，否则会贴着球抖。 */
   deadband: number;
+  /**
+   * 高度的死区（米），比 `deadband` 小。
+   *
+   * 竖直判定半轴只有 0.24m，5cm 的死区等于先送掉四分之一余量；而高度这一维
+   * 不像横移那样要「贴着球」，走小步不会抖（`stepAxis` 到点就停）。
+   */
+  deadbandY: number;
   /**
    * 认定「这球是朝我来的」的最小 z 速度（m/s）。
    * 球飞向墙 / 飞向对手时 z 分量为负，低于这个门槛就当作不是来找我的，直接回中。
@@ -96,9 +116,22 @@ export interface AutoMoveConfig {
 export const AUTO_MOVE_DEFAULTS: AutoMoveConfig = {
   speed: 4.8,
   speedZ: 3.6,
-  speedY: 9,
+  speedY: 6,
+  /**
+   * 预位阶段（球还远）的升降速度。
+   *
+   * 1.8 m/s 的依据：20cm 的预位行程走完约 110ms，比一帧 15cm 的「瞬移」慢一个
+   * 数量级，肉眼能读出「拍子在跟着球抬起来」；又不至于慢到球到了还在半路——
+   * `heightLead`=0.45s 之后还有 9 m/s 的精确档兜底。
+   */
+  speedYSlow: 1.8,
+  /** 预位幅度 20cm：真机反馈要的「上下 20cm 左右」，不是 60cm 的深蹲。 */
+  heightBand: 0.2,
+  /** 球还有 0.45s 以上到面时只预位；更近就放开全行程。 */
+  heightLead: 0.45,
   homeSpeed: 3.2,
   deadband: 0.05,
+  deadbandY: 0.02,
   incomingVz: 0.6,
   yTol: 0.2,
   maxX: 3.9,
@@ -140,8 +173,11 @@ export interface AutoMoveState {
   /** 当前握点 y（缺省 = `RACKET_POS[1]`，老调用方的兼容路径）。 */
   y?: number;
   /**
-   * 拍面中心相对握点的偏移（世界系，长度恒为 0.6）。
-   * 由 `app.ts` 在慢速帧里低通估计，挥拍时不更新。
+   * 拍面中心相对握点的偏移（世界系，长度约 0.6）。
+   *
+   * 由 `app.ts` 估两份再加起来：站着不动的握法偏移（低角速度帧低通）+ 挥拍把中心
+   * 多扫出去的那一段（每命中一球学一次）。**喂球必须用同一份**（`Rally.setFaceAimOffset`），
+   * 否则球会被瞄到另一个点上，而且每球累积（`docs/history.md` 4.23）。
    */
   center: V3;
 }
@@ -221,6 +257,11 @@ export function planAutoMove(
   const zLo = cfg.minZ + c[2];
   const zHi = cfg.maxZ + c[2];
 
+  // 起点用 `max(球现在的位置, 下界)`：采样网格锚在区间下界上，所以网格会跟着球
+  // 一起往前滑——这不是 bug，是**响应性**的来源（球当前所在的平面永远是候选），
+  // 曾经改成固定下界试过，最后一刻的横向偏差从 0.16m 掉到 0.29m（单测
+  // 「中途跑开 2.2m」直接红）。滑动的代价是相邻候选的排序每帧都会翻，规划器于是
+  // 在相邻两格之间来回改主意——那一层由 `TargetHold` 吸收。
   const pts = sampleCrossings(ball, Math.max(ball.p[2], zLo), zHi);
   if (!pts.length) return home;
 
@@ -310,6 +351,119 @@ export function stepAxis(current: number, target: number, maxStep: number, deadb
   return current + Math.sign(d) * step;
 }
 
+/** 一帧的最终站位目标（米）。 */
+export interface MoveTarget {
+  x: number;
+  y: number;
+  z: number;
+}
+
+/**
+ * 把「规划 + 保持器」变成下一帧的站位。**主循环和探针都走这一个函数**。
+ *
+ * 抽出来的原因：这段逻辑（限速步进 + 边界夹取 + 高度两段）原来在 `app.ts` 里，
+ * 而 `scripts/probe-jitter.cjs` / `probe-contact.cjs` 各抄了一份。抄的那份一旦
+ * 和主循环漂了，探针量到的就不是玩家身上的行为——这个项目吃过「单测全绿、真机
+ * 全漏」的亏，探针和主循环必须是同一份代码。
+ *
+ * ## 高度为什么分两段
+ *
+ * `eta > heightLead`（球还远）时只做 `±heightBand`（20cm）的预位、慢速挪过去；
+ * 球到跟前才放开 `minGripY–maxGripY` 的全行程和 `speedY`。
+ *
+ * 老行为是全程 `speedY`=9 m/s：一帧 15cm，抬起来是一瞬间、球一过又弹回中立位，
+ * 玩家看到的一直是回位后的 1.3m，读成「高度永远不变」。慢速预位让「跟着来球
+ * 抬/压」这件事变得可见，同时不牺牲最后那几厘米的精确对位（竖直半轴只有 0.24m）。
+ */
+export function stepAutoMove(
+  cur: { x: number; y: number; z: number },
+  plan: AutoMovePlan,
+  tg: MoveTarget,
+  dt: number,
+  cfg: AutoMoveConfig = AUTO_MOVE_DEFAULTS,
+): MoveTarget {
+  const speedX = plan.chasing ? cfg.speed : cfg.homeSpeed;
+  const speedZ = plan.chasing ? cfg.speedZ : cfg.homeSpeed;
+  const early = plan.chasing && plan.eta !== null && plan.eta > cfg.heightLead;
+  // 预位 → 精确对位之间**连续**打开，不是到点硬切。
+  //
+  // 硬切会在 `eta === heightLead` 那一帧把目标从「中立位 ±20cm」直接换成「0.75
+  // 或 1.65」，目标跳一次、人跟着反向一次（探针里 y 反向 0.04 次/球就是这么来的）。
+  // 现在用一个随 eta 线性开闸的权重：球还远时权重 0，越近越大，到面那一刻是 1。
+  const w = plan.eta === null ? 1 : clamp((cfg.heightLead - plan.eta) / Math.max(cfg.heightLead, 1e-6), 0, 1);
+  const banded = RACKET_POS[1] + clamp(tg.y - RACKET_POS[1], -cfg.heightBand, cfg.heightBand);
+  const yTarget = plan.chasing ? banded + (tg.y - banded) * w : tg.y;
+  // 回位那一段不能按举拍的 9 m/s：球刚过去、挥拍还没收完，那是单帧 15cm 的竖直
+  // 弹跳（「击球时拍子抖一下」的第二个来源）。
+  const speedY = plan.chasing ? (early ? cfg.speedYSlow : cfg.speedY) : cfg.homeSpeed;
+
+  return {
+    x: clamp(stepAxis(cur.x, tg.x, speedX * dt, cfg.deadband), -cfg.maxX, cfg.maxX),
+    y: clamp(stepAxis(cur.y, yTarget, speedY * dt, cfg.deadbandY), cfg.minGripY, cfg.maxGripY),
+    z: clamp(stepAxis(cur.z, tg.z, speedZ * dt, cfg.deadband), cfg.minZ, cfg.maxZ),
+  };
+}
+
+/**
+ * 目标保持器：把「每帧重新选点」变成「选一次点，除非必须改就不改」。
+ *
+ * ## 它治的是什么
+ *
+ * 真机反馈「移动到位之后、击球前球拍会剧烈抖一下」。这不是渲染问题，是规划器
+ * 每帧都在**重新选平面**：候选点在弹道上按 10cm 分格，相邻两个点的代价往往只差
+ * 千分之几，球再飞 6cm（一帧）排序就翻一次。于是 `targetZ` 在 0.30 / 0.36 之间
+ * 来回跳，而 `stepAxis` 把它当成「真的要挪」，每帧按 `speedZ` 满速走 6cm 再走回来
+ * ——60Hz 的 ±6cm 方波。实测（`scripts/probe-jitter.cjs`）到面前 300ms 里
+ * 前后方向反向 2–7 次，相机也跟着一起晃（`setRacketBase` 平移相机）。
+ *
+ * ## 判据：新目标离旧目标不到 `holdR` 就不动
+ *
+ * 不用低通也不用加速度限幅：那两种都只是把抖动压小，规划器照样每帧改主意。
+ * 这里问的是「换到新目标，能多打到球吗」——`holdR` 取 0.10m，比判定盘的等效
+ * 半轴（横 0.20 / 竖 0.24）小一半，落在里面本来就是「打得到，只是没那么甜」。
+ * 超过 10cm 才说明站位真的不对（球换了落点、换了高度），这时一次跳过去，
+ * 由 `stepAxis` 的速度上限拉成几帧，不会再抖。
+ *
+ * ## 球已经过去：先挥完这一拍，再回中线
+ *
+ * `chasing` 在球越过拍面那一刻翻成 false，目标立刻变成回中点——握点高度这时候
+ * 会从「蹲着接低球」一跳回到 1.3m。按 `speedY`=9 m/s 算，那是**单帧 15cm** 的
+ * 竖直弹跳，正好落在挥拍最后那两帧上，读起来就是「击球时拍子猛地一抖」。
+ * 所以球过去之后先保持原地 `settleMs`（250ms，够一次随挥收完），再回位；
+ * 回位那一段在 `app.ts` 里用 `homeSpeed` 走 y，不再用「举拍」的 9 m/s。
+ */
+export class TargetHold {
+  private cur: MoveTarget | null = null;
+  private lastChaseAt = 0;
+
+  constructor(
+    private readonly holdR = 0.1,
+    private readonly settleMs = 250,
+  ) {}
+
+  resolve(plan: AutoMovePlan, now: number): MoveTarget {
+    if (plan.chasing) this.lastChaseAt = now;
+    const want: MoveTarget = { x: plan.target, y: plan.targetY, z: plan.targetZ };
+    if (!this.cur) {
+      this.cur = want;
+      return want;
+    }
+    if (!plan.chasing) {
+      if (now - this.lastChaseAt < this.settleMs) return this.cur;
+      this.cur = want;
+      return want;
+    }
+    const d = Math.hypot(want.x - this.cur.x, want.y - this.cur.y, want.z - this.cur.z);
+    if (d > this.holdR) this.cur = want;
+    return this.cur;
+  }
+
+  reset() {
+    this.cur = null;
+    this.lastChaseAt = 0;
+  }
+}
+
 /**
  * 用一帧的姿态更新「拍面中心相对握点」的偏移估计，返回这一帧是否采信了。
  *
@@ -318,9 +472,12 @@ export function stepAxis(current: number, target: number, maxStep: number, deadb
  * 换手 / 换握法后约半秒收敛，期间走位偏差不超过一个新握法的偏移量。
  *
  * 判据用四元数夹角而不是「拍子是否在动」：手机只给角度，没有其他位置信息，
- * 角速度是唯一可靠的「这一帧能不能信」的信号。门槛取 0.6 rad/s（34°/s）：
- * 静止持拍的传感器抖动是个位数 °/s，慢速调整握持在 10–30°/s，而慢挥也有 100°/s 以上
- * ——留一档余量，宁可少采几帧（τ=0.4s 会补回来），也别把挥拍的甩动算进「握法」。
+ * 角速度是唯一可靠的「这一帧能不能信」的信号。
+ *
+ * 门槛默认 0.6 rad/s（34°/s），**大屏端传的是 1.2**：0.6 连正常的手部微动都会挡掉，
+ * 估出来的握法会卡在开局那一次，于是「站多远」一直按老姿势算——真机反馈的
+ * 「发球时按拍面角度估一次，之后拍子角度变了也不跟着改」就是这么来的（`docs/history.md` 4.23）。
+ * 真实挥拍是 100–1700°/s，1.2 rad/s（69°/s）仍然离得很远，该挡的还挡得住。
  *
  * `want` 是这一帧量到的偏移，`offset` 是被原地更新的估计值。
  */
