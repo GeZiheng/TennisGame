@@ -24,6 +24,12 @@ import {
   TargetHold,
   type AutoMoveState,
 } from '../core/auto-move';
+import {
+  buildContactSample,
+  ContactLog,
+  summarizeContacts,
+  type ContactCapture,
+} from '../core/contact-log';
 import { MockController } from './mock';
 
 /**
@@ -151,6 +157,29 @@ let contactSamples = 0;
 let missStreak = 0;
 let prevQ: [number, number, number, number] | null = null;
 
+/**
+ * 采集缓冲。`L` 开停、`K` 导出（键盘处理在文件末尾）。
+ *
+ * 它记的是**校准器的训练数据**，不是「命中率统计」：每条样本的标签是
+ * `delta = (fc − 握点) − restOffset`，也就是「挥下去那一刻拍面中心比站着不动时
+ * 多扫出去多少」。为什么这会和「打没打中」分开记，见 `core/contact-log.ts` 的说明。
+ *
+ * 默认**不开**：`L` 按一下才开始。理由是导出前数据只在内存里，忘了导出就白打了，
+ * 显式开一次能让人知道「这一轮在采」。
+ */
+const contactLog = new ContactLog();
+/**
+ * 会话名。`R`（姿态重标定）和重连都会换一个——姿态漂移是 30–60s 累积的慢变量，
+ * 段与段之间的 `yawZero` 不同，混在一起训练等于把漂移学成「走位偏差」。
+ */
+let contactSession = 's1';
+let contactSessionSeq = 0;
+/** 上一次记录的相遇时刻，用来算 `sincePrevHit`（节奏是校准器的输入之一）。 */
+let lastContactAt: number | null = null;
+/** 采集时的姿态漂移读数（度）。手机还没把读数回传上来，先留 null 占位。 */
+const contactDriftDeg: number | null = null;
+
+
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
 function updateCenterOffset(pose: ReturnType<PlayScene['syncRacket']>, dt: number) {
@@ -197,10 +226,19 @@ function noteMiss() {
  * 换挥拍幅度都会自己跟上。
  *
  * **只在命中时学**：没碰到球的姿态不能代表「击球那一刻」，学进去会把瞄准点越带越偏。
+ *
+ * ## 11-15：`fc` 改成由调用方传「接触时刻的拍面中心」
+ *
+ * 老代码这里接一个 `RacketPose`，传进来的是**渲染帧**的 `lastPose`。挥拍 30 rad/s
+ * 时，事件处理与真实接触时刻差 0–16.7ms（一帧），杆端差 1–30cm——而判定半轴只有
+ * 0.20–0.24。那点滞后是单边的（永远取到更晚的姿态），不会互相抵消，会变成一个
+ * 假偏差直接写进 `contactWant`。
+ *
+ * 现在 `Duel` 的 `contact` 事件带出 `fc`（在接触时刻用 `RacketTrack.at(t)` 算的），
+ * 这条路径上不再有那层滞后。
  */
-function learnContact(pose: ReturnType<PlayScene['syncRacket']>) {
+function learnContact(fc: readonly number[]) {
   if (!aimLearn) return;
-  const fc = faceCenter(pose);
   const want = [fc[0] - PLAYER.x, fc[1] - PLAYER.y, fc[2] - PLAYER.z];
   const k = contactSamples === 0 ? 1 : 0.45;
   for (let i = 0; i < 3; i++) {
@@ -209,6 +247,61 @@ function learnContact(pose: ReturnType<PlayScene['syncRacket']>) {
   }
   contactSamples++;
   missStreak = 0;
+}
+
+/**
+ * 采集一条相遇样本。
+ *
+ * 三种相遇都会走到这里（正常击球 / 碰到没挥 / 压根没碰到），**不按成败过滤**——
+ * 只留命中的会造成截断偏置，见 `core/contact-log.ts`。
+ *
+ * `restOffset` 取的是这一帧的值，不是「相遇前那一刻」的：两者差一帧，而它是个
+ * τ=0.3s 的一阶低通，一帧的变化在噪声以下。
+ */
+function recordContact(c: ContactCapture) {
+  contactLog.push(
+    buildContactSample({
+      t: c.t,
+      grip: [PLAYER.x, PLAYER.y, PLAYER.z],
+      rest: restOffset,
+      capture: c,
+      rally: game.rally,
+      sincePrevHit: lastContactAt === null ? null : c.t - lastContactAt,
+      driftDeg: contactDriftDeg,
+      session: contactSession,
+    })
+  );
+  lastContactAt = c.t;
+
+  // 命中的那一拍顺带喂现有的常量 EMA。校准器还没上，这条过渡路径不能断——
+  // 否则「采集打开」反而让走位变差。判据和 `Duel` 里的一致：碰到 + 挥出去。
+  if (c.hit && c.stroke) learnContact(c.fc);
+}
+
+/** 换一个采集会话。`R` 和重连都调它——姿态漂移是慢变量，跨会话不能混算。 */
+function nextContactSession() {
+  contactSessionSeq++;
+  contactSession = `s${contactSessionSeq}`;
+  lastContactAt = null;
+}
+
+/** 把攒下的样本导成 `.jsonl`（一行一条）。浏览器里没有随手可写的文件句柄。 */
+function downloadContactLog() {
+  const text = contactLog.toJsonl();
+  if (!text) {
+    flashHint('还没有采到样本：先按 L 开始记录');
+    return;
+  }
+  // 先在控制台打一份分组读数：不打文件也能看出「偏了还是散了」
+  console.log(summarizeContacts(contactLog.snapshot()));
+  const blob = new Blob([text], { type: 'application/x-ndjson' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `contact-${contactSession}-${Date.now()}.jsonl`;
+  a.click();
+  URL.revokeObjectURL(url);
+  flashHint(`已导出 ${contactLog.count} 条样本（${contactSession}）· 分组读数在控制台`);
 }
 
 /* ---------------- 连接面板 ---------------- */
@@ -318,6 +411,9 @@ function resetSession() {
   planOffset[0] = 0;
   planOffset[1] = FACE_CY;
   planOffset[2] = 0;
+  // 采集换段：新会话的手机 `performance.now()` 归零、`yawZero` 重锁，
+  // 上一段样本的时间轴和姿态基准都对不上了。
+  nextContactSession();
   flashHint('手机已接入 · 会话已重置');
 }
 
@@ -397,10 +493,13 @@ function secondaryText(): string {
  */
 function handle(e: DuelEvent) {
   switch (e.kind) {
+    case 'contact': {
+      // 采集：三种相遇（命中 / 碰到没挥 / 没碰到）共用这一个入口。
+      // 发球不走这条路径（它走 `tickToss` → `launchServe`），所以这里只有地面击球。
+      if (e.by === 'player') recordContact(e.c);
+      break;
+    }
     case 'hit': {
-      // 发球那一拍不算「击球姿态」：它是举着拍子在头上打的，学进 `learnContact`
-      // 会把地面击球的瞄准点带偏（那一层学的是「拍面扫出去多少」）。
-      if (lastPose && e.serve !== true && e.by === 'player') learnContact(lastPose);
       // 谁打的要区分——对手那一拍音效压低一点，否则听不出回合归属
       sfx.hit(e.by === 'player' ? 0.7 : 0.4, e.clean);
       scene.spawnHitFx(e.at, e.by === 'player' ? 0.7 : 0.45);
@@ -948,8 +1047,20 @@ addEventListener('keydown', (e) => {
     peakW = 0;
     // 顺带让手机重新锁一次姿态基准：发现拍子和手机歪了，按 R 就能回正
     link?.sendCtrl({ t: 'recal' });
-    flashHint('统计已重置 · 姿态重标定');
+    // 采集也跟着换段：重标定之后 `yawZero` 变了，跨段混算等于把漂移学成走位偏差
+    nextContactSession();
+    flashHint('统计已重置 · 姿态重标定 · 采集换段');
   }
+  if (k === 'l' && !e.repeat) {
+    if (contactLog.recording) {
+      contactLog.stop();
+      flashHint(`已暂停采集 · 攒了 ${contactLog.count} 条（按 K 导出）`);
+    } else {
+      contactLog.start();
+      flashHint(`开始采集（${contactSession}）· 打十几球后按 K 导出`);
+    }
+  }
+  if (k === 'k' && !e.repeat) downloadContactLog();
   if (k === 'x') {
     sfx.unlock();
     sfx.setMuted(!sfx.isMuted);

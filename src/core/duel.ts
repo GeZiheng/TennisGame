@@ -49,10 +49,13 @@ import {
 } from './physics';
 import { shotFromStroke, type Stroke } from './swing';
 import { faceCenter, RacketTrack, sweepFace, type FaceHit, type RacketPose } from './racket';
+import type { ContactCapture, StrokeTrace } from './contact-log';
 import {
   BALL_R,
   BASELINE_Z,
   DUEL_PAD,
+  FACE_MARGIN,
+  FACE_RX,
   HALF_WIDTH,
   HIT_WINDOW_MS,
   HIT_Z,
@@ -103,6 +106,15 @@ export type FaultReason = 'out' | 'net' | 'short' | 'nohit' | 'stop';
 
 export type DuelEvent =
   | { kind: 'hit'; by: DuelSide; at: V3; speed: number; clean: boolean; serve?: boolean }
+  /**
+   * 一次「球员与来球相遇」的采集记录。**只发 `by: 'player'`**，三种情形共用
+   * （正常击球 / 碰到没挥 / 压根没碰到），用 `c.hit` 和 `c.stroke` 区分。
+   *
+   * 它和 `hit` 事件是两件事：`hit` 表示「球出去了」（可能没有），`contact` 表示
+   * 「球和拍面发生过（或差点发生）关系」。采集要的是后者——漏接的球没有 `hit`，
+   * 但那正是「瞄准偏了」的证据，不能丢（见 `core/contact-log.ts` 的说明）。
+   */
+  | { kind: 'contact'; by: DuelSide; c: ContactCapture }
   | { kind: 'ground'; at: V3; half: DuelSide }
   | { kind: 'net'; by: DuelSide }
   | { kind: 'out'; by: DuelSide; at: V3 }
@@ -128,6 +140,26 @@ const BEHIND_PAD = 0.4;
 const SETUP_MAX_MS = 1600;
 /** 抛球之后多久还没打出去就算这次发球没了。 */
 const TOSS_TIMEOUT_MS = 3200;
+
+/**
+ * 采集：球心离拍面中心多近才算「这一次是真的差点打到」。
+ *
+ * 取 0.6 = 拍柄长度，约 3 个判定半轴。比这还远的「最近点」说明这一拍根本
+ * 没挥到球附近（没挥 / 挥反了 / 球从两米外飞过），把它当漏接样本会把
+ * `delta` 的均值往零拉——那正是要避免的截断偏置的镜像版本。
+ */
+const NEAR_MISS_R = 0.6;
+
+/** 采集记一条时，`at` 与 `fc` 的拷贝工具（`V3` 是元组，别留引用）。 */
+const cp3 = (v: readonly number[]): V3 => [v[0], v[1], v[2]];
+
+/** 采集：把一拍的强度信息摘成样本要的那几个量（`Stroke` 很大，只留有用的）。 */
+const strokeTrace = (s: Stroke): StrokeTrace => ({
+  peakW: s.peakW,
+  speed: s.speed,
+  charge: s.charge,
+  face: cp3(s.face),
+});
 
 /**
  * 发球第一次弹起后、飞到接发方击球面时该有多高（米）。
@@ -190,6 +222,23 @@ export class Duel {
   private contactLaunchedAt = 0;
   private contactAt = 0;
   private contactPoint: V3 | null = null;
+
+  /**
+   * 采集：本分内「球最接近拍面中心」的那一次（只记没碰到拍面盘的球）。
+   *
+   * 它在**子步**里更新，不是每帧：球速 20m/s 时一帧就走 0.33m，用帧粒度量出来的
+   * 「最近距离」误差和判定半轴同量级，那样采出来的样本反而比没有更糟。
+   * 结算时机是这一分结束时（`finish`），所以一分里只会产出一条漏接样本。
+   */
+  private nearMiss: { d: number; t: number; fc: V3; at: V3; ballV: V3 } | null = null;
+
+  /**
+   * 采集：球已经碰到拍面盘、但挥拍事件还没到（网络 20–60ms + 玩家可能提前挥）。
+   *
+   * 这一段不能立刻发 `contact`：`tickContact` 还会在冻结窗口里再试一次 `takeStroke`，
+   * 成功了就是「挥晚了但打到了」。等它给答案再发，一拍只记一条。
+   */
+  private pendingContact: { t: number; fc: V3; at: V3; ballV: V3; offCenter: number } | null = null;
 
   /**
    * @param liveStroke 抢跑取拍：球已经贴在拍面上时，直接从检测器里取
@@ -270,6 +319,8 @@ export class Duel {
     this.pending = [];
     this.playerTrack.reset();
     this.machineTrack.reset();
+    this.nearMiss = null;
+    this.pendingContact = null;
     this.machine.reset(now);
     this.machine.setHome(0);
     this.ball = makeBall([0, BALL_R, OPP_BASELINE_Z + 0.45], [0, 0, 0]);
@@ -390,6 +441,9 @@ export class Duel {
     this.pending = [];
     this.bouncesOnReceiver = 0;
     this.servePending = false;
+    // 采集状态不能跨分：上一分的「最近点 / 待结算接触」属于上一分
+    this.nearMiss = null;
+    this.pendingContact = null;
 
     if (info.server === 'machine') this.machineServe(now, ev);
     else this.playerServeSetup(now, ev);
@@ -663,21 +717,43 @@ export class Duel {
     if (!pose) return true;
 
     const hit = sweepFace(pose, p0, p1);
-    if (!hit) return true;
+    if (!hit) {
+      // 采集：球没进拍面盘。**这一类才是「走位/瞄准偏了」的证据**，只记命中的球
+      // 会引入截断偏置（保留 |Δ| < 判定半轴的那部分，均值必然偏小）。
+      if (this.receiver === 'player') this.watchNearMiss(p1, t, pose);
+      return true;
+    }
 
-    this.enterContact(this.receiver, hit, s0 + (s1 - s0) * hit.s, now, ev);
+    // 接触时刻单独取一份姿态：`pose` 是子步**中点**的，`hit.s` 给出的是球真正穿过
+    // 拍面平面的位置。挥拍 30 rad/s 时半个子步就是十几度、十几厘米。判定继续用中点
+    // 姿态（不动既有行为），但采集必须用接触时刻那一份，否则标签自带一个假偏差。
+    const tHit = s0 + (s1 - s0) * hit.s;
+    this.enterContact(this.receiver, hit, track.at(tHit) ?? pose, tHit, now, ev);
     // 球已被接住或已打出去，剩下的子步不能再推进
     return false;
   }
 
-  private enterContact(side: DuelSide, hit: FaceHit, t: number, now: number, ev: DuelEvent[]) {
+  private enterContact(
+    side: DuelSide,
+    hit: FaceHit,
+    pose: RacketPose,
+    t: number,
+    now: number,
+    ev: DuelEvent[]
+  ) {
     this.contactSide = side;
     this.contactAt = t;
     this.contactPoint = [...hit.at] as V3;
 
+    // 碰到拍面这一刻的来球速度。下面三行就把球钉在命中点上了，之后再取只剩 0——
+    // 而「球速 / 入射角」是校准器的输入之一（快球会挥得急）。
+    const ballV = cp3(this.ball.v);
+
     if (side === 'player') {
       this.diag.reaches++;
       this.diag.lastOffCenter = hit.offCenter;
+      // 够到了，之前记的「最近点」作废——它属于更早一次接近
+      this.nearMiss = null;
     }
 
     // 把球按在命中点上
@@ -689,11 +765,35 @@ export class Duel {
     if (side === 'player') {
       // 玩家多半是提前挥拍，先试一次，不需要任何等待
       const s = this.takeStroke(t);
+      this.recordLag(t, s);
       if (s) {
-        this.recordLag(t, s);
+        // 采集要在 `launchPlayer` 之前发：`launch` 会把 `contactPoint` 清掉
+        ev.push({
+          kind: 'contact',
+          by: 'player',
+          c: {
+            t,
+            fc: faceCenter(pose),
+            at: cp3(hit.at),
+            ballV,
+            hit: true,
+            offCenter: hit.offCenter,
+            lag: this.diag.lastLag,
+            stroke: strokeTrace(s),
+            serve: false,
+          },
+        });
         this.launchPlayer(s, now, ev);
       } else {
-        this.recordLag(t, null);
+        // 还没挥：`tickContact` 还会在冻结窗口里再试一次。等它给答案再发 sample，
+        // 一拍只记一条（否则「挥晚了但打到了」会被记成「没挥」）。
+        this.pendingContact = {
+          t,
+          fc: faceCenter(pose),
+          at: cp3(hit.at),
+          ballV,
+          offCenter: hit.offCenter,
+        };
       }
       return;
     }
@@ -716,12 +816,14 @@ export class Duel {
     const s = this.takeStroke(this.contactAt);
     if (s) {
       this.recordLag(this.contactAt, s);
+      this.emitPendingContact(s, ev);
       this.launchPlayer(s, now, ev);
       return ev;
     }
 
     if (now - this.contactAt > CONTACT_HOLD_MS) {
       this.recordLag(this.contactAt, null);
+      this.emitPendingContact(null, ev);
       // 球不能按原速穿过拍面飞走（看起来就是穿模）。让它擦框掉下去，
       // 和 HUD 那句「漏接」对得上——墙打那边同一条处理。
       this.ball.v = [0, -1.2, -0.8];
@@ -729,6 +831,96 @@ export class Duel {
       this.finish('machine', '没挥拍', now, ev);
     }
     return ev;
+  }
+
+  /**
+   * 采集：把「碰到拍面、但当时还没挥」的那一条补完并发出。
+   *
+   * 两种结局共用：冻结窗口内挥到了（`s` 非空，是「挥晚了但打到」），或者超时
+   * 判给对手（`s` 为 null）。几何部分早就定死了（`pendingContact`），这里只补
+   * 「到底挥没挥」这一个自由度——所以同一拍不可能被记成两份。
+   */
+  private emitPendingContact(s: Stroke | null, ev: DuelEvent[]) {
+    const p = this.pendingContact;
+    this.pendingContact = null;
+    if (!p) return;
+    ev.push({
+      kind: 'contact',
+      by: 'player',
+      c: {
+        t: p.t,
+        fc: p.fc,
+        at: p.at,
+        ballV: p.ballV,
+        hit: true,
+        offCenter: p.offCenter,
+        lag: this.diag.lastLag,
+        stroke: s ? strokeTrace(s) : null,
+        serve: false,
+      },
+    });
+  }
+
+  /**
+   * 采集：球没进拍面盘时，在**子步**里追「最接近拍面中心」的那一次。
+   *
+   * 只留 0.6m 以内的：超过就说明这一拍根本没挥到球附近，那种样本不是「瞄偏了」，
+   * 采进来会把 `delta` 的均值往零拉。
+   */
+  private watchNearMiss(p1: V3, t: number, pose: RacketPose) {
+    const fc = faceCenter(pose);
+    const d = Math.hypot(p1[0] - fc[0], p1[1] - fc[1], p1[2] - fc[2]);
+    if (d > NEAR_MISS_R) return;
+    if (this.nearMiss && d >= this.nearMiss.d) return;
+    this.nearMiss = { d, t, fc, at: cp3(p1), ballV: cp3(this.ball.v) };
+  }
+
+  /**
+   * 采集：这一分结束时把「最近点」结算成一条漏接样本。
+   *
+   * 没碰到拍面就没有盘内归一化坐标，`offCenter` 用「最近距离 / 等效半轴」近似——
+   * 等效半轴 = 盘面半轴 + 球半径 + 判定余量，和 `faceCovers` 里那一组一致。
+   * 它只用于筛选和排序，不参与 `delta` 的计算。
+   */
+  private flushNearMiss(ev: DuelEvent[]) {
+    const m = this.nearMiss;
+    this.nearMiss = null;
+    if (!m) return;
+    const near = this.nearestStroke(m.t);
+    ev.push({
+      kind: 'contact',
+      by: 'player',
+      c: {
+        t: m.t,
+        fc: m.fc,
+        at: m.at,
+        ballV: m.ballV,
+        hit: false,
+        offCenter: m.d / (FACE_RX + BALL_R + FACE_MARGIN),
+        lag: near ? near.t - m.t : null,
+        stroke: near ? strokeTrace(near) : null,
+        serve: false,
+      },
+    });
+  }
+
+  /**
+   * 离 `t` 最近的一次未用挥拍。**采集用，不消费**：不置 `used`、不写 `diag`。
+   *
+   * 为什么要在这里找：漏接的球没有 `takeStroke` 去消费挥拍，但「挥了没碰到」和
+   * 「压根没挥」是两种完全不同的漏接——前者是瞄准偏了（校准器要修的），后者是
+   * 走位把人带到了够不着的地方。混成一种会把 `delta` 的均值往零拉。
+   *
+   * 不写 `diag` 是为了不让 HUD 的时差读数跟着动：那些挥拍没有匹配到球，
+   * 让它们冒充「这一球的时差」会把「没挥」和「挥晚了」显示成同一个数。
+   */
+  private nearestStroke(t: number): Stroke | null {
+    let best: Stroke | null = null;
+    for (const s of this.pending) {
+      if (s.used) continue;
+      if (!best || Math.abs(s.t - t) < Math.abs(best.t - t)) best = s;
+    }
+    return best;
   }
 
   private recordLag(t: number, matched: Stroke | null) {
@@ -813,6 +1005,8 @@ export class Duel {
     this.phaseAt = this.contactAt || now;
     this.contactSide = null;
     this.contactPoint = null;
+    // 采集：「最近点」是相对上一次接近球而言的，球已经打出去了就作废
+    this.nearMiss = null;
 
     if (this.receiver === 'machine') this.machine.beginPlay(now);
 
@@ -940,6 +1134,10 @@ export class Duel {
 
   private finish(winner: DuelSide, reason: string, now: number, ev: DuelEvent[]) {
     if (this.phase === 'wait' || this.phase === 'over') return;
+
+    // 采集：一分结束，把「球最接近拍面但没碰到」记成一条漏接样本。放在最前面，
+    // 这样它在事件流里排在计分之前，和「先相遇、后判分」的时序一致。
+    this.flushNearMiss(ev);
 
     const outcome = this.match.awardPoint(winner);
     ev.push({ kind: 'point', winner, reason, rally: this.rally });

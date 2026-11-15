@@ -44,6 +44,8 @@ execFileSync(
     'src/core/auto-move.ts',
     // 挥拍枢轴：纯计算（拍柄方向的最小弧 + 腰/肘混合），不碰 three
     'src/core/swing-rig.ts',
+    // 击球采集：组装 / 分桶 / 序列化都是纯函数。`duel.ts` 里的采集点靠它自己测
+    'src/core/contact-log.ts',
     'src/play/stats.ts',
     '--outDir',
     out,

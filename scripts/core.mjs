@@ -43,6 +43,8 @@ export const CORE_FILES = [
   'duel',
   'auto-move',
   'swing-rig',
+  // 击球采集：`duel.ts` 发 `contact` 事件时用到它的类型，probe / duel-sim 也要编
+  'contact-log',
 ].map((n) => `src/core/${n}.ts`);
 
 export function buildCore() {

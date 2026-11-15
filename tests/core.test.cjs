@@ -17,6 +17,8 @@ const { serveBox, serveStandX, inServeBox, serveAim, serveStrike, tossContact, O
   TOSS_Y0, TOSS_VY, SERVE_ANCHOR_R, SERVE_STRIKE_UP, SERVE_STRIKE_FWD, SERVE_STAND_Z } = require('./core/serve.js');
 const { BALL_R, HIT_Z, RACKET_POS, FACE_RX, FACE_RY, FACE_CY, NET_Z, NET_H, HALF_WIDTH, PHYS_DT, OPP_HIT_Z, OPP_BASELINE_Z, BASELINE_Z, GRAVITY } = require('./core/court.js');
 const { sweepFace, faceCovers, faceCenter, frontFace, RacketTrack, IDLE_POSE } = require('./core/racket.js');
+const { buildContactSample, lagBuckets, samplesToJsonl, summarizeContacts, usableForCalibration,
+  ContactLog } = require('./core/contact-log.js');
 
 let pass = 0;
 const t = (name, fn) => {
@@ -1998,6 +2000,166 @@ t('只有玩家发球局才把人钉在发球位', () => {
   d.phase = 'wait';
   d.match.server = 'machine';
   assert.strictEqual(d.playerServeStanceX, null, '对手的发球局不给发球位');
+});
+
+console.log('对打 · 击球采集');
+
+/** 造一个「球正飞向玩家拍面」的对打局，姿态恒为 IDLE（拍面中心在握点正上方 0.6m）。 */
+const liveDuelWithBall = (ballX = 0) => {
+  const d = new Duel();
+  d.phase = 'live';
+  d.hitter = 'machine';
+  d.receiver = 'player';
+  d.servePending = false;
+  const fc = faceCenter(IDLE_POSE);
+  // +0.37 是 0.28s 自由落体的高度，让球到面时正好落在拍面中心附近
+  d.ball = makeBall([ballX, fc[1] + 0.37, -3], [0, 0, 12]);
+  return { d, fc };
+};
+
+/** 跑若干帧，返回全部事件。`submitAt` 那一刻塞一份挥拍。 */
+const runLive = (ballX, submitAt = null) => {
+  const { d, fc } = liveDuelWithBall(ballX);
+  let now = 0;
+  const out = [];
+  for (let i = 0; i < 400; i++) {
+    now += 1000 / 60;
+    d.pushRacket({ t: now, pos: [...IDLE_POSE.pos], q: [...IDLE_POSE.q] });
+    if (submitAt !== null && Math.abs(now - submitAt) < 1) {
+      d.submit({ t: now, peakW: 18, head: [0, 0, 20], speed: 20, face: [0, 0, -1], grip: [0, 1, 0], charge: 0.6, used: false });
+    }
+    for (const e of d.update(1 / 60, now)) out.push(e);
+    if (out.some((e) => e.kind === 'point')) break;
+  }
+  return { ev: out, fc };
+};
+
+t('球碰到拍面：发一条 hit=true 的 contact，fc 是接触时刻的拍面中心', () => {
+  const { ev, fc } = runLive(0);
+  const c = ev.find((e) => e.kind === 'contact');
+  assert.ok(c, '应该有 contact 事件');
+  assert.strictEqual(c.by, 'player');
+  assert.strictEqual(c.c.hit, true);
+  for (let i = 0; i < 3; i++) assert.ok(Math.abs(c.c.fc[i] - fc[i]) < 1e-6, '姿态恒定，fc 应等于静止时拍面中心');
+  assert.ok(c.c.offCenter < 1, '命中时应在盘内');
+  assert.ok(c.c.ballV[2] > 0, '来球速度要在接触前取，不能是被清成 0 的那份');
+});
+
+t('没碰到拍面：也发一条 contact，hit=false 且带最近点', () => {
+  const { ev } = runLive(0.4);
+  const c = ev.find((e) => e.kind === 'contact');
+  assert.ok(c, '漏接也要有样本，否则训练集有截断偏置');
+  assert.strictEqual(c.c.hit, false);
+  assert.ok(c.c.offCenter > 1, '偏离 0.4m 应在盘外');
+  assert.ok(Math.abs(c.c.at[0] - 0) < 0.5, 'at 是球最接近拍面中心那一点，不是随便一帧');
+});
+
+t('命中且挥出去：contact 带 stroke；同一拍只记一条', () => {
+  const { ev } = runLive(0, 300);
+  const cs = ev.filter((e) => e.kind === 'contact');
+  assert.strictEqual(cs.length, 1, '一拍只能记一条（否则「挥晚了但打到」会被记成「没挥」）');
+  assert.strictEqual(cs[0].c.hit, true);
+  assert.ok(cs[0].c.stroke, '挥了就该带上强度信息');
+  assert.strictEqual(cs[0].c.stroke.peakW, 18);
+});
+
+t('挥了但没碰到：stroke 有值、hit=false —— 这才是「瞄准偏了」', () => {
+  const { ev } = runLive(0.4, 300);
+  const c = ev.find((e) => e.kind === 'contact');
+  assert.strictEqual(c.c.hit, false);
+  assert.ok(c.c.stroke, '「挥了没碰到」不能记成「没挥」');
+  assert.ok(c.c.lag !== null);
+});
+
+t('delta = (fc − 握点) − restOffset，模长不超过一根拍柄的两倍', () => {
+  const s = buildContactSample({
+    t: 100,
+    grip: [0, 1.3, 0.3],
+    rest: [0, 0.6, 0],
+    capture: { t: 100, fc: [0.1, 1.9, 0.4], at: [0.1, 1.9, 0.4], ballV: [0, 0, 10],
+      hit: true, offCenter: 0.1, lag: 12, stroke: { peakW: 20, speed: 22, charge: 0.5, face: [0, 0, -1] }, serve: false },
+    rally: 2, sincePrevHit: 1200, driftDeg: null, session: 's1',
+  });
+  assert.ok(Math.abs(s.label.delta[0] - 0.1) < 1e-9);
+  assert.ok(Math.abs(s.label.delta[1] - 0.0) < 1e-9);
+  assert.ok(Math.abs(s.label.delta[2] - 0.1) < 1e-9);
+  const norm = Math.hypot(...s.label.delta);
+  assert.ok(norm <= 1.2 + 1e-9, '两根 0.6m 的杆，差的最大模长就是 1.2');
+});
+
+t('样本里的坐标是拷贝：改源数组不会改到已记的样本', () => {
+  const grip = [0, 1.3, 0.3];
+  const rest = [0, 0.6, 0];
+  const s = buildContactSample({
+    t: 1, grip, rest,
+    capture: { t: 1, fc: [0, 1.9, 0.3], at: [0, 1.9, 0.3], ballV: [0, 0, 10],
+      hit: true, offCenter: 0, lag: null, stroke: null, serve: false },
+    rally: 1, sincePrevHit: null, driftDeg: null, session: 's1',
+  });
+  grip[1] = 99;
+  rest[1] = 99;
+  assert.strictEqual(s.label.G[1], 1.3);
+  assert.strictEqual(s.label.rest[1], 0.6);
+  assert.strictEqual(s.feat.rest[1], 0.6);
+});
+
+const mkSample = (lag, dx, opts = {}) => buildContactSample({
+  t: 0, grip: [0, 1.3, 0.3], rest: [0, 0.6, 0],
+  capture: { t: 0, fc: [dx, 1.9, 0.3], at: [dx, 1.9, 0.3], ballV: [0, 0, 10],
+    hit: opts.hit !== false, offCenter: 0.1, lag, stroke: null, serve: opts.serve === true },
+  rally: 1, sincePrevHit: null, driftDeg: null, session: 's1',
+});
+
+t('发球样本排除在训练集之外，漏接样本保留', () => {
+  assert.strictEqual(usableForCalibration(mkSample(10, 0.1)), true);
+  assert.strictEqual(usableForCalibration(mkSample(10, 0.1, { hit: false })), true, '漏接必须留，否则有截断偏置');
+  assert.strictEqual(usableForCalibration(mkSample(10, 0.1, { serve: true })), false);
+});
+
+t('lag 分桶：三桶、lag 为 null 的不进桶、发球不进桶', () => {
+  const rows = [
+    mkSample(-50, 0.2), mkSample(-10, 0.4), mkSample(40, 0.6), mkSample(null, 0.9),
+    mkSample(5, 0.8, { serve: true }),
+  ];
+  const b = lagBuckets(rows, [-25, 25]);
+  assert.strictEqual(b.length, 3);
+  assert.strictEqual(b[0].n, 1);
+  assert.strictEqual(b[1].n, 1);
+  assert.strictEqual(b[2].n, 1);
+  assert.ok(Math.abs(b[0].mean[0] - 0.2) < 1e-9);
+  assert.ok(Math.abs(b[2].mean[0] - 0.6) < 1e-9);
+});
+
+t('JSONL：一行一条、分组齐全、空集合给空串', () => {
+  assert.strictEqual(samplesToJsonl([]), '');
+  const text = samplesToJsonl([mkSample(10, 0.1), mkSample(20, 0.3)]);
+  const lines = text.trim().split('\n');
+  assert.strictEqual(lines.length, 2);
+  const row = JSON.parse(lines[0]);
+  for (const k of ['label', 'feat', 'meta']) assert.ok(row[k], `缺 ${k} 组`);
+  assert.ok('G' in row.label && 'delta' in row.label);
+  assert.ok('lag' in row.feat && 'rest' in row.feat);
+  assert.strictEqual(row.label.rest[1], 0.6, 'label 和 feat 的 rest 应是同一份快照');
+});
+
+t('分组读数把「命中」和「没碰到」分开列', () => {
+  const text = summarizeContacts([mkSample(10, 0.2), mkSample(10, 0.6, { hit: false })]);
+  assert.ok(text.includes('命中'));
+  assert.ok(text.includes('没碰到'));
+  assert.ok(text.includes('n=1'), '两组各一条，不能合并');
+});
+
+t('采集未开启时 push 静默丢弃，开了才攒', () => {
+  const log = new ContactLog();
+  log.push(mkSample(10, 0.1));
+  assert.strictEqual(log.count, 0);
+  log.start();
+  log.push(mkSample(10, 0.1));
+  assert.strictEqual(log.count, 1);
+  log.stop();
+  log.push(mkSample(10, 0.1));
+  assert.strictEqual(log.count, 1);
+  assert.strictEqual(log.toJsonl().trim().split('\n').length, 1);
 });
 
 console.log(`\n${pass} 项通过`);
