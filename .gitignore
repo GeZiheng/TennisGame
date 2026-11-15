@@ -1,6 +1,8 @@
 node_modules/
 dist/
-.tmp-*/
+# 编译产物与一次性脚本都放 .tmp-* 下。这里刻意不带斜杠：只忽略目录的话，
+# 随手丢在根目录的 .tmp-scan.cjs 会直接进版本库（11-15 踩过）。
+.tmp-*
 .cert/
 *.log
 .DS_Store

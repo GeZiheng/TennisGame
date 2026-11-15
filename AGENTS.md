@@ -356,9 +356,10 @@ npm run verify        # 全套验证：test ×3 → duel-sim → build
 |---|---|
 | `probe-contact.cjs` | **量「球到面那一刻真实拍面中心离瞄准点多远」**。自己喂球到瞄准点（不用回球机，理由见脚本头），逐球量 Δ 与命中率。`GRIP=vert\|tilt\|horiz`、`MODE=rest\|contact`。当前：斜握 0.128 → 0.048m、竖握 0.406 → 0.278m、横握 0.303 → 0.192m |
 | `probe-jitter.cjs` | 逐球量「到面前 300ms」握点的**反向次数**与单帧位移。抖动（相邻两帧来回走）只有它能看见，`GRIP=horiz` 最敏感。判据是「相邻 3 帧内翻转」，隔十几帧的起立/蹲下不算 |
-| `probe-scan2.cjs` | 逐 vy 扫描一次出球，对比「竖平面窗口」与「盘形判定」两种回球判据 |
-| `probe-serve.cjs` / `probe-serve2.cjs` | 弹地发球可行域、单参数求解器自检 |
 | `probe-pose.cjs` | 姿态连续性门限在 20–35 rad/s 挥拍下会不会误伤（纯计算，不碰 DOM） |
+
+诊断脚本只有这三个：**弹道 / 发球几何没有专属探针**，看 `npm run duel-sim` 的回合数与单测。
+（墙打时代的 `probe-scan2` / `probe-serve` / `probe-serve2` 随墙打删除，11-15 清理时一并移走。）
 
 环境坑（踩过，别重踩）：手机**必须 HTTPS**（`http://192.168.x.x` 不是安全上下文，传感器被静默拦截）；微信/QQ 内置浏览器不下发 `DeviceMotion`；两端必须在**同一个进程**（信令房间在内存）；终端打印的 `172.x` 地址是 WSL/Docker，连不上。
 

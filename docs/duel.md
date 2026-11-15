@@ -249,7 +249,8 @@ npm run dev:https      # HTTPS :5184（真机必须走这条）
 要让它同时还有 1.3m 高，落点只能在这一段。`ARRIVE_TARGET_Z_MAX` = -1.5
 就是这个上限；下限随站位变，见 `candidateTargets()`：`lo = posZ + 0.45·d`。
 
-实测各深度的可打落点带（`.tmp-bench/aim-solve.cjs`）：
+实测各深度的可打落点带（一次性脚本，已随对墙打一起清掉；数来自 11-12 的实测，重扫用
+`aimIntoCourt` 按深度扫一遍即可）：
 
 | 迎击点 z | 可打的目标落点 |
 |---|---|

@@ -47,10 +47,10 @@ function probeHints() {
   const hits = (...keys) => list.some((f) => keys.some((k) => f.includes(k)));
   const hints = [];
   if (hits('physics', 'court', 'serve')) {
-    hints.push('  涉及弹道 / 发球几何 → node scripts/probe-serve.cjs、node scripts/probe-serve2.cjs');
+    hints.push('  涉及弹道 / 发球几何 → npm run duel-sim（看回合数有没有掉）；瞄准偏差看 node scripts/probe-contact.cjs');
   }
   if (hits('racket', 'swing')) {
-    hints.push('  涉及挥拍 / 拍面判定 → node scripts/probe-scan2.cjs；挥拍扫走拍面的缺口看 probe-contact');
+    hints.push('  涉及挥拍 / 拍面判定 → node scripts/probe-contact.cjs（挥拍把拍面扫走多远、还中不中）');
   }
   if (hits('auto-move')) {
     hints.push('  涉及走位 → GRIP=horiz node scripts/probe-jitter.cjs（反向次数应为 0）、node scripts/probe-contact.cjs（斜握 MODE=contact 的瞄准误差应 <0.05m）');
