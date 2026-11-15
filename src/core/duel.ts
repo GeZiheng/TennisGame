@@ -65,7 +65,7 @@ import {
   RACKET_POS,
 } from './court';
 import { BallMachine, type MachineConfig } from './machine';
-import { TennisMatch, pointLabel, type ServeCourt } from './match';
+import { TennisMatch, otherSide, pointLabel, type ServeCourt, type Side } from './match';
 import {
   serveAim,
   serveBox,
@@ -80,7 +80,13 @@ import {
 } from './serve';
 import type { V3 } from './vec';
 
-export type DuelSide = 'player' | 'machine';
+/**
+ * 与 `match.ts` 的 `Side` 是同一个类型，不是第二份定义。
+ *
+ * 历史上两处各写了一遍 `'player' | 'machine'`，连「取对面」都各有一个
+ * （`otherSide` 与 `other`）。同一个概念写两次必然漂——现在只有一个 literal union。
+ */
+export type DuelSide = Side;
 export type DuelPhase = 'wait' | 'setup' | 'toss' | 'live' | 'contact' | 'over';
 
 export interface DuelScore {
@@ -174,7 +180,7 @@ const SERVE_ARRIVE_MIN = 1.35;
 const SERVE_ARRIVE_MAX = 2.1;
 const SERVE_ARRIVE_WANT = 1.65;
 
-const other = (s: DuelSide): DuelSide => (s === 'player' ? 'machine' : 'player');
+const other = otherSide;
 const halfOf = (z: number): DuelSide => (z > NET_Z ? 'player' : 'machine');
 const clamp = (v: number, lo: number, hi: number) => (v < lo ? lo : v > hi ? hi : v);
 
@@ -510,7 +516,15 @@ export class Duel {
     this.status = '抛球';
   }
 
-  /** 抛球阶段：球只有重力，玩家必须自己挥拍把它打出去。 */
+  /**
+   * 抛球阶段：球只有重力，玩家必须自己挥拍把它打出去。
+   *
+   * **这是「发球不进校准器训练集」的实现点**：判定走这里独立的 `tossContact`，
+   * 不经过 `checkReceiverFace` / `enterContact`，所以一个 `contact` 事件都不会发。
+   * 这条是定下来的规则——抛球位置 4.25 已定稿、不需要校准，而且举在头上打的杆向量
+   * 分布和地面击球不是一回事。别为了「多攒点数据」把它并进统一采集，那会把地面
+   * 击球的均值带偏。护栏测试见 `tests/core.test.cjs` 的「发球：抛球阶段挥拍…」。
+   */
   private tickToss(dt: number, now: number, ev: DuelEvent[]): DuelEvent[] {
     const t0 = now - dt * 1000;
     advance(
@@ -710,6 +724,14 @@ export class Duel {
     now: number,
     ev: DuelEvent[]
   ): boolean {
+    // 只有 live 才判接球。**这行顺带决定了「发球不进采集」**：发球阶段 `phase` 是
+    // 'toss'，球走 `tickToss` 里独立的 `tossContact` 判定，压根到不了这里，所以
+    // `contact` 事件里的 `serve` 永远是 false。这条是定下来的规则（抛球位置 4.25 已
+    // 定稿，不需要校准），别为了「数据更多」把发球接进来。
+    // 只有 live 才判接球。发球不进采集**不是靠这一行**——那是 `update()` 把
+    // `phase === 'toss'` 直接派给 `tickToss`、而 `tickToss` 只用 `tossContact`
+    // 判定的结果（见 `startToss` / `tickToss` 的注释）。这一行挡的是 `contact`
+    // 阶段的重复判定。
     if (this.phase !== 'live') return true;
     const t = (s0 + s1) * 0.5;
     const track = this.receiver === 'player' ? this.playerTrack : this.machineTrack;

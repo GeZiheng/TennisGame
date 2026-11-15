@@ -1,67 +1,124 @@
-import QRCode from 'qrcode';
+/**
+ * 一局游戏的**编排层**：连接、收包、挥拍检测、主循环、事件分发、键位。
+ *
+ * 只有对打一种模式（对墙打在 11-15 删掉了，见 `docs/history.md` 4.27）。
+ *
+ * ## 分工
+ *
+ * | 谁 | 管什么 |
+ * |---|---|
+ * | `core/duel.ts` | 规则（分 → 局 → 盘、两次发球） |
+ * | `core/machine.ts` | 对手 |
+ * | `play/player.ts` | 站位、走位、瞄准偏移（**手感状态**） |
+ * | `play/session.ts` | 时钟、丢包、延迟、序号（**一次连接**的状态） |
+ * | `play/recorder.ts` | 击球采集与落盘 |
+ * | `play/scene.ts` | 画面 |
+ * | `play/hud.ts` / `spark.ts` / `panel.ts` | 只读状态、只写 DOM |
+ * | **这里** | 把它们串成一条主循环 |
+ *
+ * ## 这个文件里刻意只剩两件事
+ *
+ * 1. **主循环的调用顺序**。它是全项目唯一有强制先后关系的地方（见 `loop()` 的注释），
+ *    分散到别的文件就没人看得出顺序是有意的了。
+ * 2. **会话复位的一次性通知**。`resetSession()` 现在只有 6 行——每个对象自己负责
+ *    「重连时该清什么」。原来它是 15 个赋值，加一个状态就得记得回来补一行，
+ *    而 `docs/history.md` 4.12 的 bug 正是漏清了一个。
+ *
+ * 网络层（时钟同步、重连复位、姿态连续性、抢跑取拍）是这个项目里最贵也最爱出错的
+ * 代码，它不该有第二个拷贝。
+ */
+
 import { PlayScene } from './scene';
 import { Sfx } from './audio';
-import { Link, randomRoom, type LinkState } from '../net/link';
-import {
-  decodePacket,
-  ACCEL_FULL_SCALE_G,
-  GYRO_FULL_SCALE_RAD,
-  type CtrlMsg,
-} from '../core/protocol';
-import { LatencyWindow, PacketStats, ClockSync } from './stats';
+import { Link } from '../net/link';
+import { decodePacket, type CtrlMsg } from '../core/protocol';
 import { SwingDetector } from '../core/swing';
 import { Duel, type DuelEvent } from '../core/duel';
-import { FACE_CY, HIT_WINDOW_MS, RACKET_POS } from '../core/court';
-import { faceCenter, frontFace } from '../core/racket';
-import { serveAim, serveBox, serveStrike, SERVE_STAND_Z } from '../core/serve';
+import { serveAim, serveBox, serveStrike } from '../core/serve';
 import { vrot } from '../core/vec';
-import {
-  AUTO_MOVE_DEFAULTS,
-  blendCenterOffset,
-  planAutoMove,
-  stepAutoMove,
-  stepAxis,
-  TargetHold,
-  type AutoMoveState,
-} from '../core/auto-move';
-import {
-  buildContactSample,
-  ContactLog,
-  summarizeContacts,
-  type ContactCapture,
-} from '../core/contact-log';
+import type { RacketPose } from '../core/racket';
+import type { ContactCapture } from '../core/contact-log';
+import { Session } from './session';
+import { PlayerRig } from './player';
+import { ContactRecorder } from './recorder';
+import { ConnectPanel } from './panel';
+import { drawSpark } from './spark';
+import * as hud from './hud';
 import { MockController } from './mock';
 
+const qs = new URLSearchParams(location.search);
+
 /**
- * 一局游戏的**完整前端**：连接、收包、挥拍检测、走位、渲染、HUD。
+ * 挥拍枢轴（`core/swing-rig.ts`）：默认开，`?rig=0` 关，`G` 键切。
  *
- * 只有对打一种模式（对墙打在 11-15 删掉了，见 `docs/history.md` 4.27）。这一份
- * 文件同时是「网络那一段」的唯一实现——时钟同步、重连复位、姿态连续性、抢跑取拍，
- * 是这个项目里最贵也最爱出错的代码，它不该有第二个拷贝。
- *
- * 分工：`core/duel.ts` 是规则（分 → 局 → 盘、两次发球），`core/machine.ts` 是对手，
- * `core/auto-move.ts` 是走位，`scene.ts` 是画面。这里只负责把它们串成一条主循环。
+ * 它把握点从「钉在原地」改成「绕腰/肘走一段弧」，所以拍面中心在挥拍中会平移
+ * 最多 0.18m。判定是扫掠的、位移也限了幅，模拟器 A/B 里命中率没有变化，但
+ * 「手感对不对」只有真机能回答。
  */
-const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
+let rigOn = qs.get('rig') !== '0';
 
-const canvas = $<HTMLCanvasElement>('scene');
-const panel = $<HTMLDivElement>('connect-panel');
-const linkStateEl = $<HTMLParagraphElement>('link-state');
-const roomEl = $<HTMLElement>('room-code');
-const urlEl = $<HTMLElement>('ctrl-url');
-const qrEl = $<HTMLCanvasElement>('qr');
-const sparkEl = $<HTMLCanvasElement>('spark');
-const verdictEl = $<HTMLElement>('verdict');
-
-let scene: PlayScene;
 const sfx = new Sfx();
 const swing = new SwingDetector();
+const session = new Session();
+const sparkEl = document.getElementById('spark') as HTMLCanvasElement;
+
 /**
- * 抢跑取拍：球停在击球面上时，直接从检测器里取「正在进行中」的这一挥。
+ * 自动走位与瞄准点学习的开关。
  *
- * 不这么做的话，球要等峰值回落结算完才飞得出去——玩家手已经挥完了，
- * 球还在拍面上悬着，这就是「球弹回的点比接触点晚」的原因。
- * 取走之后立刻 consume，防止同一次挥拍在回落时被再结算一次。
+ * `?auto=0` 关自动走位（回到 A/D 手动跑位）；`?aim=rest` 关瞄准点学习（回到
+ * 「瞄站着不动的拍面」）。后者没绑键位——它是「这一局怎么打」的选择，不是临场动作。
+ */
+const rig = new PlayerRig({
+  autoMove: qs.get('auto') !== '0',
+  aimLearn: qs.get('aim') !== 'rest',
+});
+
+const recorder = new ContactRecorder({
+  onHint: hud.flashHint,
+  onBadge: hud.setRecBadge,
+  // 命中就学：这是采集打开时唯一还在跑的「过渡路径」，断掉会让走位立刻变差
+  onHit: (fc) => rig.learn(fc),
+});
+
+const panel = new ConnectPanel({
+  onPairReady: () => resetSession(),
+  onUnlock: () => sfx.unlock(),
+});
+
+let scene: PlayScene;
+/** 规则对象。只有一个实现者，但保留具名变量：主循环里 `game.` 比 `duel.` 更说明意图 */
+let game: Duel;
+let link: Link | null = null;
+let mock = new MockController();
+
+let fps = 0;
+let frames = 0;
+let lastFpsAt = performance.now();
+let lastFrame = performance.now();
+
+/**
+ * 最近一帧的球拍位姿。HUD 的「拍面」读数用它。
+ *
+ * 这个数字回答的是「握持偏了多少度」：系统把手机的姿态直接当成拍面的姿态
+ * （见 `core/attitude.ts`），而手机在手里的角度和你脑子里的拍面并不重合。
+ * 因为出球方向有 72% 来自拍面法线，这个偏角会被放大 0.71 倍打到球的飞行方向上——
+ * 偏 10°，十米外就差 1.2 米，玩家感觉到的就是「手感不对」而不是「我握歪了」。
+ */
+let lastPose: RacketPose | null = null;
+let lastSpeed = 0;
+let lastShot = '—';
+
+/** 当前按住的键（小写）。`rig.step` 每帧读它，手动永远优先于自动走位 */
+const held = new Set<string>();
+
+/* ---------------- 抢跑取拍 ---------------- */
+
+/**
+ * 球停在击球面上时，直接从检测器里取「正在进行中」的这一挥。
+ *
+ * 不这么做的话，球要等峰值回落结算完才飞得出去——玩家手已经挥完了，球还在拍面上
+ * 悬着，这就是「球弹回的点比接触点晚」的原因。取走之后立刻 consume，防止同一次
+ * 挥拍在回落时被再结算一次。
  */
 const liveStroke = (near: number) => {
   const live = swing.peekLive(near);
@@ -71,383 +128,47 @@ const liveStroke = (near: number) => {
   return live;
 };
 
-/** 规则对象。只有一个实现者，但保留具名变量：主循环里出现 `game.` 比 `duel.` 更说明意图。 */
-let game: Duel;
-
-const latency = new LatencyWindow();
-/** 采样 → 处理 的整条链路，比 latency 多出手机端的采样与发包等待 */
-const endToEnd = new LatencyWindow();
-const packets = new PacketStats();
-const clock = new ClockSync();
-
-let peakG = 0;
-let peakW = 0;
-let frames = 0;
-let fps = 0;
-let mock = new MockController();
-let link: Link | null = null;
-
-const qs = new URLSearchParams(location.search);
-const room = (qs.get('room') ?? randomRoom()).toUpperCase().slice(0, 4);
-
-/**
- * 自动走位：默认**开**，`?auto=0` 关，`F` 键临时切换。
- *
- * 它替代的是「一边盯来球一边按 A/D」这个对大部分人都太难的输入。判定、出球、
- * 挥拍检测一行没动——只是把玩家横向搬到球会经过的位置。要复现「跑不到位」的
- * 手感（或者拍演示视频）就按 F 关掉。键盘随时可以顶替它（手动永远优先）。
- *
- * 玩家这一侧只负责挥拍。11-10 到 11-13 之间还有过一条「摄像头追胸口色块」的
- * 输入通道，11-13 决定撤掉（用户明说近期不需要），见 `docs/history.md` 4.21。
- */
-let autoMove = qs.get('auto') !== '0';
-
-/**
- * 挥拍枢轴（`core/swing-rig.ts`）：默认开，`?rig=0` 关，`G` 键切。
- *
- * 它把握点从「钉在原地」改成「绕腰/肘走一段弧」，所以拍面中心在挥拍中会平移
- * 最多 0.18m（`maxShift`）。判定是扫掠的、位移也限了幅，模拟器 A/B 里命中率
- * 没有变化（`npm run duel-sim` 开关两档的回合数差在噪声内），但「手感对不对」
- * 只有真机能回答。
- */
-let rigOn = qs.get('rig') !== '0';
-
-/**
- * 瞄准点学习（11-14 晚）：默认开，`?aim=rest` 关掉（回到「瞄站着不动的拍面」）。
- *
- * 留这个开关是因为它改的是**人往哪儿站**：关掉之后走位瞄的是「站着不动时的拍面」，
- * 真机 A/B 才有对照组。没有绑键位——它是「这一局怎么打」的选择，不是临场动作。
- */
-let aimLearn = qs.get('aim') !== 'rest';
-
-/**
- * 拍面中心相对**基座**（走位用的那个握点）的偏移（世界系，长度恒为 `FACE_CY`=0.6）。
- *
- * 自动走位要的是「拍面中心对准球」，不是「握点对准球」。这两者只在拍子竖直握时重
- * 合：握法一横，拍面就在握点侧方 0.6m，而判定半轴只有 0.24m —— 站对了也打空。
- *
- * 这里有两份偏移，加起来才是走位该瞄的那个点：
- *
- * 1. `restOffset` —— **站着不动时的握法偏移**。不能直接用实时 `faceCenter`：
- *    挥拍本身把中心甩出 0.3–1.1m，每帧跟着走就是「一挥拍人被拽着跑」
- *    （`docs/history.md` 4.5 的老问题）。所以只在角速度 < 1.2 rad/s 的帧采信，
- *    τ=0.3s 一阶跟踪。门限 0.6 → 1.2 是 11-14 放宽的：0.6 rad/s（34°/s）连
- *    正常的手部微动都会挡掉，估出来的握法会**卡在开局那一次**，于是「站多远」
- *    一直按老姿势算（真机反馈「走位没控制好与球的水平距离」）。1.2 rad/s
- *    （69°/s）仍远低于真实挥拍（100–1700°/s）。
- * 2. `contactDelta` —— **挥下去那一刻**拍面比站着时多扫出去的那一段，每命中一球
- *    学一次（`learnContact`）。挥拍 40–80° 会把中心扫出 40–60cm，比判定盘还宽；
- *    不补这一段，走位瞄的就是「我站着不动时的拍面」。
- *
- * 两份偏移都喂给走位（`planAutoMove` 的 `center`）。墙打时代还要**同时**喂给喂球，
- * 否则球会被瞄到另一个点上、每球累积一次把人推到边界（`docs/history.md` 4.23）；
- * 11-15 删掉墙打之后来球由回球机自己算（瞄固定高度带，不看玩家拍面），
- * 这一半约束随之消失（4.27）。
- */
-const restOffset: [number, number, number] = [0, FACE_CY, 0];
-/** 平滑后的「击球瞬间 − 站着不动」偏移，逐帧朝 `contactWant` 收敛。 */
-const contactDelta: [number, number, number] = [0, 0, 0];
-/** 上一拍学到的目标值。只在新命中时更新，所以两拍之间是一条直线。 */
-const contactWant: [number, number, number] = [0, 0, 0];
-/** 走位用的瞄准偏移 = `restOffset + contactDelta`。 */
-const planOffset: [number, number, number] = [0, FACE_CY, 0];
-/** 学到的样本数：0 表示还没命中过，此时 `planOffset` 就是老行为。 */
-let contactSamples = 0;
-/** 连续没打到的球数。用来在「学歪了」时自动退回老行为，见 `noteMiss`。 */
-let missStreak = 0;
-let prevQ: [number, number, number, number] | null = null;
-
-/**
- * 采集缓冲。`L` 开停、`K` 导出（键盘处理在文件末尾）。
- *
- * 它记的是**校准器的训练数据**，不是「命中率统计」：每条样本的标签是
- * `delta = (fc − 握点) − restOffset`，也就是「挥下去那一刻拍面中心比站着不动时
- * 多扫出去多少」。为什么这会和「打没打中」分开记，见 `core/contact-log.ts` 的说明。
- *
- * 默认**不开**：`L` 按一下才开始。理由是导出前数据只在内存里，忘了导出就白打了，
- * 显式开一次能让人知道「这一轮在采」。
- */
-const contactLog = new ContactLog();
-/**
- * 会话名。`R`（姿态重标定）和重连都会换一个——姿态漂移是 30–60s 累积的慢变量，
- * 段与段之间的 `yawZero` 不同，混在一起训练等于把漂移学成「走位偏差」。
- */
-let contactSession = 's1';
-let contactSessionSeq = 0;
-/** 上一次记录的相遇时刻，用来算 `sincePrevHit`（节奏是校准器的输入之一）。 */
-let lastContactAt: number | null = null;
-/** 采集时的姿态漂移读数（度）。手机还没把读数回传上来，先留 null 占位。 */
-const contactDriftDeg: number | null = null;
-
-
-const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
-
-function updateCenterOffset(pose: ReturnType<PlayScene['syncRacket']>, dt: number) {
-  const fc = faceCenter(pose);
-  const want: [number, number, number] = [
-    fc[0] - PLAYER.x,
-    fc[1] - PLAYER.y,
-    fc[2] - PLAYER.z,
-  ];
-  if (prevQ) blendCenterOffset(prevQ, pose.q, dt, want, restOffset, 1.2, 0.3);
-  prevQ = [pose.q[0], pose.q[1], pose.q[2], pose.q[3]];
-
-  // 学到的补偿不要在两拍之间跳：命中那一刻只有一个样本，逐帧收敛（τ=0.45s）
-  const k = 1 - Math.exp(-Math.max(dt, 0) / 0.45);
-  for (let i = 0; i < 3; i++) {
-    contactDelta[i] += (contactWant[i] - contactDelta[i]) * k;
-    planOffset[i] = restOffset[i] + contactDelta[i];
-  }
-  // 对打的来球是回球机打的、不看玩家拍面，所以这里**不需要**再往里喂一份偏移。
-  // 墙打时代这一行是 `Rally.setFaceAimOffset(planOffset)`，删模式时一起去掉了；
-  // `Duel` 没有对应接口是有意的，不是漏了。
-}
-
-/**
- * 连续漏接的兜底：学到的偏移可能把人带进「怎么打都打不到」的死角
- * （换握法、换了挥拍幅度、或者干脆没在挥），而**没命中就不学**，于是永远出不来。
- *
- * 连丢三球之后每球把 `contactWant` 缩 30%：它是在往回退到 `restOffset`，也就是
- * 「瞄站着不动的拍面」这个老行为——那个至少不会系统性偏半个拍面。
- * 只要打中一球就清零重来，所以正常的球不会触发。
- */
-function noteMiss() {
-  if (!aimLearn) return;
-  missStreak++;
-  if (missStreak < 3) return;
-  for (let i = 0; i < 3; i++) contactWant[i] *= 0.7;
-}
-
-/**
- * 这一拍命中时，记下「拍面中心真的扫到了哪儿」，作为下一拍的瞄准点。
- *
- * 它和 `restOffset` 的差就是挥拍带来的那一段：横握绕横轴压拍 30° 就是 35cm 横向
- * + 50cm 纵深，竖握主要是纵深和高度。每一拍重学一次（EMA 0.45），玩家换握法 /
- * 换挥拍幅度都会自己跟上。
- *
- * **只在命中时学**：没碰到球的姿态不能代表「击球那一刻」，学进去会把瞄准点越带越偏。
- *
- * ## 11-15：`fc` 改成由调用方传「接触时刻的拍面中心」
- *
- * 老代码这里接一个 `RacketPose`，传进来的是**渲染帧**的 `lastPose`。挥拍 30 rad/s
- * 时，事件处理与真实接触时刻差 0–16.7ms（一帧），杆端差 1–30cm——而判定半轴只有
- * 0.20–0.24。那点滞后是单边的（永远取到更晚的姿态），不会互相抵消，会变成一个
- * 假偏差直接写进 `contactWant`。
- *
- * 现在 `Duel` 的 `contact` 事件带出 `fc`（在接触时刻用 `RacketTrack.at(t)` 算的），
- * 这条路径上不再有那层滞后。
- */
-function learnContact(fc: readonly number[]) {
-  if (!aimLearn) return;
-  const want = [fc[0] - PLAYER.x, fc[1] - PLAYER.y, fc[2] - PLAYER.z];
-  const k = contactSamples === 0 ? 1 : 0.45;
-  for (let i = 0; i < 3; i++) {
-    // 单轴夹到 ±0.55m：0.6 的杆子再转也就这么大，超出去说明这一拍不是正常击球
-    contactWant[i] = clamp(contactWant[i] + (clamp(want[i] - restOffset[i], -0.55, 0.55) - contactWant[i]) * k, -0.55, 0.55);
-  }
-  contactSamples++;
-  missStreak = 0;
-}
-
-/**
- * 采集一条相遇样本。
- *
- * 三种相遇都会走到这里（正常击球 / 碰到没挥 / 压根没碰到），**不按成败过滤**——
- * 只留命中的会造成截断偏置，见 `core/contact-log.ts`。
- *
- * `restOffset` 取的是这一帧的值，不是「相遇前那一刻」的：两者差一帧，而它是个
- * τ=0.3s 的一阶低通，一帧的变化在噪声以下。
- */
-function recordContact(c: ContactCapture) {
-  contactLog.push(
-    buildContactSample({
-      t: c.t,
-      grip: [PLAYER.x, PLAYER.y, PLAYER.z],
-      rest: restOffset,
-      capture: c,
-      rally: game.rally,
-      sincePrevHit: lastContactAt === null ? null : c.t - lastContactAt,
-      driftDeg: contactDriftDeg,
-      session: contactSession,
-    })
-  );
-  lastContactAt = c.t;
-
-  // 命中的那一拍顺带喂现有的常量 EMA。校准器还没上，这条过渡路径不能断——
-  // 否则「采集打开」反而让走位变差。判据和 `Duel` 里的一致：碰到 + 挥出去。
-  if (c.hit && c.stroke) learnContact(c.fc);
-}
-
-/** 换一个采集会话。`R` 和重连都调它——姿态漂移是慢变量，跨会话不能混算。 */
-function nextContactSession() {
-  contactSessionSeq++;
-  contactSession = `s${contactSessionSeq}`;
-  lastContactAt = null;
-}
-
-/** 把攒下的样本导成 `.jsonl`（一行一条）。浏览器里没有随手可写的文件句柄。 */
-function downloadContactLog() {
-  const text = contactLog.toJsonl();
-  if (!text) {
-    flashHint('还没有采到样本：先按 L 开始记录');
-    return;
-  }
-  // 先在控制台打一份分组读数：不打文件也能看出「偏了还是散了」
-  console.log(summarizeContacts(contactLog.snapshot()));
-  const blob = new Blob([text], { type: 'application/x-ndjson' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `contact-${contactSession}-${Date.now()}.jsonl`;
-  a.click();
-  URL.revokeObjectURL(url);
-  flashHint(`已导出 ${contactLog.count} 条样本（${contactSession}）· 分组读数在控制台`);
-}
-
-/* ---------------- 连接面板 ---------------- */
-
-async function resolveControllerUrl(): Promise<{ url: string; insecure: boolean }> {
-  const port = location.port ? `:${location.port}` : '';
-  let host = location.hostname;
-  let protocol = location.protocol.replace(':', '');
-  try {
-    const res = await fetch('/__lanip');
-    const data = (await res.json()) as { ips?: string[]; protocol?: string };
-    if (data.ips?.length) host = data.ips[0];
-    // 用服务端实际跑的协议，不要用 location 的：https 模式下 location 就是 https，
-    // 但如果哪天做了反代，这两者会不一致，以服务端为准更可靠
-    if (data.protocol) protocol = data.protocol;
-  } catch {
-    /* 非 dev server 环境（比如直接预览构建产物）就只能用当前 host */
-  }
-  return {
-    url: `${protocol}://${host}${port}/controller.html?room=${room}`,
-    insecure: protocol === 'http',
-  };
-}
-
-function setLinkState(state: LinkState, detail?: string) {
-  // `ready` = 信令确认「房间里 host 和 peer 都在」，也就是一次新的配对。
-  // 手机重新扫码会重载 controller.html，时钟和包序号都从头开始，而大屏页面
-  // 一直没刷新——必须在数据到达前把上一段连接的状态清干净，见 resetSession()。
-  if (state === 'ready') resetSession();
-
-  const map: Record<LinkState, [string, string]> = {
-    idle: ['准备中…', ''],
-    waiting: ['等待手机接入…', ''],
-    ready: ['已找到对方，正在建立直连…', ''],
-    connecting: ['正在建立点对点通道…', ''],
-    connected: ['已连接', 'ok'],
-    closed: ['连接中断，等待重连…', 'bad'],
-    error: [`连接失败：${detail ?? ''}`, 'bad'],
-  };
-  const [text, cls] = map[state];
-  linkStateEl.textContent = text;
-  linkStateEl.className = `link-state ${cls}`;
-
-  const connected = state === 'connected';
-  panel.style.display = connected ? 'none' : 'block';
-  document.body.classList.toggle('playing', connected);
-  if (connected) {
-    sfx.unlock();
-    $<HTMLElement>('game-hud').hidden = false;
-  }
-}
-
-/* ---------------- 收包 ---------------- */
-
-/**
- * 最近处理过的包序号。
- *
- * imu 通道是 `ordered: false`（为了不被重传拖慢），代价是 WiFi 抖动时旧包可能后到。
- * 直接应用会让球拍姿态「往回跳一下」——玩家未必读成「丢包」，但一定会读成「不跟手」。
- * 所以落后于已处理序号的包直接丢弃，姿态只往前走。
- */
-let lastImuSeq = -1;
+/* ---------------- 会话 ---------------- */
 
 /**
  * 新配对 = 新会话，把只属于「一次连接」的状态全部清掉。
  *
  * 大屏页面从不刷新，`Link` 也只在 boot() 里 new 一次；手机那边重新扫码却是
  * 一个全新的页面：`performance.now()` 归零、包序号从 0 开始、姿态基准重新锁。
- * 三处残留各自都能单独造成「重连后一球都打不到」：
  *
- *   - `ClockSync` 的 offset 停在旧时钟差，而它只采纳「RTT 明显更优」的样本，
- *     收敛后门限形同锁死 → 挥拍时刻被换算到几万毫秒外，`takeStroke` 的
- *     ±150ms 窗口一条都匹配不上，连 `peekLive` 抢跑也一起失效；
- *   - `lastImuSeq` 停在旧的大序号，新会话的包全被当成乱序旧包丢掉，拍子僵住；
- *   - `SwingDetector` 里可能还留着上次挥到一半的 armed 峰，会被 `peekLive`
- *     当成「正在挥」误取；`Duel.pending` 里则是时间轴已经错掉的旧挥拍。
+ * 每一处残留都能单独造成「重连后一球都打不到」，所以清理分散在四个拥有者里
+ * （`Session` / `SwingDetector` / `Duel` / `PlayerRig`），这里只负责通知。
+ * **加新的会话状态时，请给它找一个拥有者，而不是回来往这个函数里补一行。**
  *
- * 这些都不属于「一局游戏」，换人就该清零。姿态平滑（`smoothQ`）不清：新会话
- * 第一包到了会在 22ms 内收敛过去，强行归位反而让拍子凭空跳一下。
+ * 姿态平滑（`scene.smoothQ`）不清：新会话第一包到了会在 22ms 内收敛过去，
+ * 强行归位反而让拍子凭空跳一下。
  */
 function resetSession() {
-  clock.reset();
+  session.reset();
   swing.reset();
-  lastImuSeq = -1;
-  packets.reset();
-  latency.clear();
-  endToEnd.clear();
-  peakG = 0;
-  peakW = 0;
   game.reset();
-  targetHold.reset();
-  // 挥拍枢轴的准备姿态是「上一次挥拍之后学到的握法」，换会话必须重学，
-  // 否则新会话第一帧就会凭空带一段弧。
   scene.resetRig();
-  // 握法偏移、击球偏移也一样：新会话第一帧没有可信的姿态基准，重新从「竖直握
-  // → 拍面在正上方」起步（和 `restOffset` 的初值一致），别带着上一场的学到的量。
-  prevQ = null;
-  contactSamples = 0;
-  missStreak = 0;
-  for (let i = 0; i < 3; i++) {
-    contactWant[i] = 0;
-    contactDelta[i] = 0;
-  }
-  restOffset[0] = 0;
-  restOffset[1] = FACE_CY;
-  restOffset[2] = 0;
-  planOffset[0] = 0;
-  planOffset[1] = FACE_CY;
-  planOffset[2] = 0;
+  rig.reset();
   // 采集换段：新会话的手机 `performance.now()` 归零、`yawZero` 重锁，
   // 上一段样本的时间轴和姿态基准都对不上了。
-  nextContactSession();
-  flashHint('手机已接入 · 会话已重置');
+  recorder.nextSession();
+  hud.flashHint('手机已接入 · 会话已重置');
 }
+
+/* ---------------- 收包 ---------------- */
 
 function onPacket(pkt: ReturnType<typeof decodePacket>) {
   if (!pkt) return;
   const now = performance.now();
-
-  packets.mark(pkt.seq, now);
-  // 兜底：万一没收到 ready（信令层重连），也要认出新会话的 seq 从 0 重来。
-  // imu 通道无序，正常乱序只差几包；回退 240 包（≈4s @60Hz）只可能是新会话。
-  // 原来写的 1000 包要求上一次连接至少打满 16.7 秒，短会话重连会全量丢包。
-  if (lastImuSeq > 240 && pkt.seq + 240 < lastImuSeq) lastImuSeq = -1;
-  if (pkt.seq <= lastImuSeq) return;
-  lastImuSeq = pkt.seq;
-
-  if (clock.isValid) {
-    const oneWay = now - clock.toLocal(pkt.tSend);
-    // 时钟同步还没收敛时会出现负值，直接丢掉，别污染分位数
-    if (oneWay >= 0 && oneWay < 800) latency.add(oneWay);
-
-    // 端到端 = 采样时刻 → 这一帧被处理。比单向多出「采样等待 + 发包排队」，
-    // 也就是手机那一段。两个数一起看才知道该治手机还是治网络。
-    const e2e = now - clock.toLocal(pkt.tSample);
-    if (e2e >= 0 && e2e < 800) endToEnd.add(e2e);
-  }
+  // 序号判定 + 延迟统计 + 峰值都在 Session 里：乱序包既不该进统计也不该更新峰值
+  if (!session.ingest(pkt, now)) return;
 
   scene.setOrientation(pkt.q);
-  if (pkt.peakG > peakG) peakG = pkt.peakG;
-  if (pkt.peakW > peakW) peakW = pkt.peakW;
 
   // 挥拍检测在大屏端做，不在手机端做。
   // 理由：传感器数据本来就每一帧都传过来了，检测放这边可以统一时间轴，
   // 击球判定需要的「挥拍时刻」直接就是本地时钟，不用再做一次跨端换算。
-  const tLocal = clock.isValid ? clock.toLocal(pkt.tSend) : now;
+  const tLocal = session.clock.isValid ? session.clock.toLocal(pkt.tSend) : now;
   const stroke = swing.push({ t: tLocal, omega: pkt.gyro, q: pkt.q });
   if (stroke) {
     // 先让球拍亮一下：哪怕这一下没打到球，玩家也该看到「系统知道你挥了」
@@ -458,47 +179,35 @@ function onPacket(pkt: ReturnType<typeof decodePacket>) {
 
 function onCtrl(msg: CtrlMsg) {
   if (msg.t === 'pong') {
-    clock.ingest(msg.t0, msg.t1, msg.t2, performance.now());
+    session.clock.ingest(msg.t0, msg.t1, msg.t2, performance.now());
   }
 }
 
-/* ---------------- 游戏事件 ---------------- */
-
-let lastSpeed = 0;
-let lastShot = '—';
+/* ---------------- 事件 ---------------- */
 
 /**
- * 主数字：**本局比分**（0 / 15 / 30 / 40 / AD，抢七是数字）。
+ * 采集一条相遇样本。
  *
- * HUD 的节点是固定的（`index.html` 里那一套 id），所以这里只换显示内容，
- * 不换 DOM 结构——多一套节点就多一份会跟主循环失去同步的缓存。
+ * 快照要在 `rig.learn()` **之前**取——`recorder.record()` 内部会在命中时回调
+ * `onHit` → `rig.learn()`。取晚了记到的就是「学完之后」的瞄准点。
  */
-function primaryText(): string {
-  // 一盘结束之后主数字改成局分：那才是「这一场」的最终结果
-  if (game.match.over) return `${game.match.games[0]}:${game.match.games[1]}`;
-  return `${game.pointText('player')}:${game.pointText('machine')}`;
-}
-
-/** 副数字：**局分**。 */
-function secondaryText(): string {
-  return `${game.match.games[0]}:${game.match.games[1]}`;
+function recordContact(c: ContactCapture) {
+  recorder.record(c, { ...rig.snapshot(), rally: game.rally });
 }
 
 /**
  * 事件分发。
  *
- * 两种模式合并成一种之后，这里最大的简化是：**每个事件都带 `by`**。墙打时代
- * 要用 `'by' in e` 区分「这一拍是谁打的」（因为墙打的事件里没有这个字段），
- * 现在不用了。
+ * 每个事件都带 `by`，所以不用再区分「这一拍是谁打的」——墙打时代要靠
+ * `'by' in e` 判断，因为那种模式的事件里没有这个字段。
  */
 function handle(e: DuelEvent) {
   switch (e.kind) {
-    case 'contact': {
-      // 采集：三种相遇（命中 / 碰到没挥 / 没碰到）共用这一个入口。
+    case 'contact':
+      // 三种相遇（命中 / 碰到没挥 / 没碰到）共用这一个入口。
       // 发球不走这条路径（它走 `tickToss` → `launchServe`），所以这里只有地面击球。
       if (e.by === 'player') recordContact(e.c);
       break;
-    }
     case 'hit': {
       // 谁打的要区分——对手那一拍音效压低一点，否则听不出回合归属
       sfx.hit(e.by === 'player' ? 0.7 : 0.4, e.clean);
@@ -508,32 +217,31 @@ function handle(e: DuelEvent) {
         // 拍型只有玩家那一拍有意义：对手的出球是求解器直接给的，没有「上旋/平击」
         lastShot = e.serve ? '发球' : e.clean ? '击球' : '拍面没打开';
       }
-      flashPrimary(false);
+      hud.flashPrimary(game, false);
       break;
     }
     case 'ground':
-      // `DuelEvent` 的落地事件不带速度（墙打时代那一个是撞墙/擦地的合成事件）
       sfx.bounce(4);
       scene.spawnBounceFx(e.at);
       break;
     case 'net':
-      if (e.by === 'player') noteMiss();
+      if (e.by === 'player') rig.miss();
       sfx.net();
       break;
     case 'out':
       lastShot = '出界';
-      flashHint(e.by === 'player' ? '出界了' : '对手打出界');
+      hud.flashHint(e.by === 'player' ? '出界了' : '对手打出界');
       break;
     case 'miss':
       // 对手漏接也会走到这里，只有玩家的漏接能说明「瞄准学歪了」
-      if (e.by === 'player') noteMiss();
-      flashHint(e.reason === 'stop' ? '球停在拍面上了' : '两跳，球在你这边落了两次');
+      if (e.by === 'player') rig.miss();
+      hud.flashHint(e.reason === 'stop' ? '球停在拍面上了' : '两跳，球在你这边落了两次');
       break;
     case 'point':
       sfx.end();
       lastShot = e.reason;
-      flashHint(`${e.winner === 'player' ? '你' : '对手'}得分 · ${e.reason}`);
-      flashPrimary(true);
+      hud.flashHint(`${e.winner === 'player' ? '你' : '对手'}得分 · ${e.reason}`);
+      hud.flashPrimary(game, true);
       break;
     case 'fault': {
       // 二发的失误由紧跟其后的 point 事件播报（「双误」），这里不抢话。
@@ -546,420 +254,40 @@ function handle(e: DuelEvent) {
           stop: '没打出去',
         };
         const text = why[e.reason] ?? e.reason;
-        flashHint(e.by === 'player' ? `一发失误（${text}）· 还有一次` : `对手一发失误（${text}）`);
+        hud.flashHint(e.by === 'player' ? `一发失误（${text}）· 还有一次` : `对手一发失误（${text}）`);
       }
       if (e.reason === 'net') sfx.net();
       break;
     }
     case 'game':
       sfx.end();
-      flashHint(e.winner === 'player' ? '这一局拿下' : '这一局被对手拿下');
+      hud.flashHint(e.winner === 'player' ? '这一局拿下' : '这一局被对手拿下');
       break;
     case 'tiebreak':
-      flashHint('6:6 · 抢七，先到 7 分', 2600);
+      hud.flashHint('6:6 · 抢七，先到 7 分', 2600);
       break;
     case 'matchOver':
       sfx.end();
       lastShot = '比赛结束';
-      flashHint(
+      hud.flashHint(
         `${e.winner === 'player' ? '你赢了这一盘' : '对手赢了这一盘'} ${e.games[0]}:${e.games[1]} · 按 C 重开`,
         6000
       );
-      flashPrimary(true);
+      hud.flashPrimary(game, true);
       break;
     case 'serve': {
       const who = e.by === 'player' ? '你发球' : '对手发球';
       const court = e.court === 'deuce' ? '右区' : '左区';
-      flashHint(`${who} · ${e.attempt === 1 ? '一发' : '二发'} · ${court}`);
+      hud.flashHint(`${who} · ${e.attempt === 1 ? '一发' : '二发'} · ${court}`);
       break;
     }
   }
 }
 
-/* ---------------- HUD ---------------- */
-
-function fmt(v: number, unit = 'ms', digits = 1) {
-  return Number.isFinite(v) ? `${v.toFixed(digits)}${unit}` : '—';
-}
-
-function flashPrimary(strong: boolean) {
-  const el = $<HTMLElement>('s-streak');
-  el.textContent = primaryText();
-  el.classList.remove('pop', 'pop-soft');
-  void el.offsetWidth; // 强制重排，否则动画不会重播
-  el.classList.add(strong ? 'pop' : 'pop-soft');
-}
-
-let hintTimer = 0;
-/**
- * @param ms 显示时长。默认 1600ms（够读一句「出界了」），但「抢七」「这盘结束」
- *   这类要读两行、还要带操作提示的话，1.6 秒会一闪而过。
- */
-function flashHint(text: string, ms = 1600) {
-  const el = $<HTMLElement>('s-hint');
-  el.textContent = text;
-  el.classList.add('show');
-  clearTimeout(hintTimer);
-  hintTimer = window.setTimeout(() => el.classList.remove('show'), ms);
-}
-
-function updateHud() {
-  const el = (id: string) => $<HTMLElement>(id);
-
-  el('s-streak').textContent = primaryText();
-  el('s-best').textContent = secondaryText();
-  el('s-speed').textContent = lastSpeed > 0 ? `${Math.round(lastSpeed * 3.6)}` : '—';
-  el('s-shot').textContent = lastShot;
-
-  el('s-fps').textContent = String(fps);
-  el('s-hz').textContent = `${packets.hz}`;
-
-  /* ---- 击球诊断：打不到球的时候，这四个数就是答案 ---- */
-  const d = game.diag;
-  el('s-swings').textContent = String(d.swings);
-  el('s-reaches').textContent = String(d.reaches);
-
-  const lagEl = el('s-lag');
-  if (d.lastLag === null) {
-    // 球到过头顶/脚边都算，但连一次挥拍都没记录到，那就是角速度没上来
-    lagEl.textContent = d.reaches > 0 ? '未挥拍' : '—';
-    lagEl.className = `v ${d.reaches > 0 ? 'bad' : ''}`;
-  } else {
-    const lag = Math.round(d.lastLag);
-    const a = Math.abs(lag);
-    lagEl.textContent = a <= 20 ? '正好' : `${lag > 0 ? '晚' : '早'} ${a}ms`;
-    lagEl.className = `v ${a > HIT_WINDOW_MS * 2 ? 'bad' : a > HIT_WINDOW_MS ? 'warn' : ''}`;
-  }
-
-  // 甜区偏离：0% 打在拍面正中，100% 是拍框内沿，null = 压根没碰到拍面。
-  //
-  // 严格碰撞上线后这是「为什么打不到」的第一现场——球从拍面上方 5cm 掠过，
-  // 和从左边 40cm 掠过，表现都是「没打到」，但一个要调拍面角度、一个要走位。
-  const atyEl = el('s-aty');
-  if (d.lastOffCenter === null) {
-    atyEl.textContent = d.reaches > 0 ? '没碰到' : '—';
-    atyEl.className = `v ${d.reaches > 0 ? 'bad' : ''}`;
-  } else {
-    const oc = Math.round(d.lastOffCenter * 100);
-    atyEl.textContent = `${oc}%`;
-    atyEl.className = `v ${oc > 85 ? 'warn' : ''}`;
-  }
-
-  // 拍面朝向：球拍法线（设备 +Z 经姿态旋转后）与「正对球场」的夹角。
-  //
-  // 系统把手机的姿态**直接**当成拍面的姿态，而手机在手里的角度和你脑子里的拍面
-  // 并不重合——扁手机握在掌心必然有内外旋，常见 5–15°。出球方向有 72% 来自拍面法线，
-  // 所以这个偏角会被放大 0.71 倍打到球的飞行方向上：偏 10°，十米外就差 1.2 米。
-  // 表现不是「我握歪了」，而是「手感不对」——因为屏幕上没有任何东西告诉你偏了多少。
-  //
-  // 静止持拍、拍面正对球场时，这个数应该接近 0。如果是 10–15°，那才是真正的噪声源，
-  // 比传感器本身的精度（β/γ 有重力参考，1–2°）大一个量级。
-  const faceEl = el('s-face');
-  // 没收到手机的姿态包时球拍是待机姿态（法线背对球场，算出来正好 180°），
-  // 那个数字没有意义，宁可显示空。
-  if (!lastPose || packets.hz === 0) {
-    faceEl.textContent = '—';
-    faceEl.className = 'v';
-  } else {
-    const [qx, qy, qz, qw] = lastPose.q;
-    // q 作用在 (0,0,1) 上：即设备屏幕法线在世界系里的方向。
-    // 拍子是双面的，反手时这根法线指着身后——先翻成朝球场那一面再算偏角，
-    // 否则反手位会一直读到「180°」，看着像握歪了，其实那是正常的背面。
-    const [fx, fy, fz] = frontFace([
-      2 * (qx * qz + qw * qy),
-      2 * (qy * qz - qw * qx),
-      1 - 2 * (qx * qx + qy * qy),
-    ]);
-    if (Math.abs(fy) > 0.75) {
-      // 拍面几乎水平：这时候「水平偏角」没有意义，直接说明朝上/朝下
-      faceEl.textContent = fy > 0 ? '朝上' : '朝下';
-      faceEl.className = 'v warn';
-    } else {
-      const deg = (Math.atan2(fx, -fz) * 180) / Math.PI;
-      const a = Math.abs(deg);
-      faceEl.textContent = a < 3 ? '正' : `${deg > 0 ? '右' : '左'}${Math.round(a)}°`;
-      faceEl.className = `v ${a > 20 ? 'bad' : a > 8 ? 'warn' : ''}`;
-    }
-  }
-
-  // 出球延迟：球到面之后停了多久才被打出去。抢跑生效时应该是个位数。
-  const latEl = el('s-latency');
-  if (d.lastLatency === null) {
-    latEl.textContent = '—';
-    latEl.className = 'v';
-  } else {
-    const ms = Math.round(d.lastLatency);
-    latEl.textContent = `${ms}ms`;
-    latEl.className = `v ${ms > 80 ? 'bad' : ms > 40 ? 'warn' : ''}`;
-  }
-
-  const loss = packets.lossRate * 100;
-  const lossEl = el('s-loss');
-  lossEl.textContent = packets.hz > 0 ? `${loss.toFixed(1)}%` : '—';
-  lossEl.className = `v ${loss > 3 ? 'bad' : loss > 1 ? 'warn' : ''}`;
-
-  el('s-p50').textContent = fmt(latency.p50);
-  el('s-p95').textContent = fmt(latency.p95);
-
-  // 端到端：从手机采到这一帧姿态，到它被大屏处理完。这是玩家真正感觉到的那段延迟。
-  const e2eEl = el('s-e2e');
-  const e2eP50 = endToEnd.p50;
-  if (Number.isFinite(e2eP50)) {
-    e2eEl.textContent = `${e2eP50.toFixed(0)}ms`;
-    // 端到端 <50ms 基本无感，50–90 能察觉但玩得下去，>90 就是「球拍有惯性」了
-    e2eEl.className = `v ${e2eP50 > 90 ? 'bad' : e2eP50 > 50 ? 'warn' : 'accent'}`;
-  } else {
-    e2eEl.textContent = '—';
-    e2eEl.className = 'v accent';
-  }
-
-  const jit = latency.jitter;
-  const jitEl = el('s-jit');
-  jitEl.textContent = Number.isFinite(jit) ? `${jit.toFixed(0)}ms` : '—';
-  jitEl.className = `v ${jit > 80 ? 'bad' : jit > 30 ? 'warn' : ''}`;
-
-  const gEl = el('s-g');
-  gEl.textContent = peakG > 0 ? `${peakG.toFixed(1)}g` : '—';
-  gEl.className = `v ${peakG >= ACCEL_FULL_SCALE_G * 0.97 ? 'bad' : peakG >= 8 ? 'warn' : ''}`;
-
-  const wEl = el('s-w');
-  const wDps = (peakW * 180) / Math.PI;
-  wEl.textContent = peakW > 0 ? `${wDps.toFixed(0)}` : '—';
-  wEl.className = `v ${peakW >= GYRO_FULL_SCALE_RAD * 0.97 ? 'bad' : wDps >= 1200 ? 'warn' : ''}`;
-
-  const verdict = !Number.isFinite(jit)
-    ? ['—', '']
-    : jit < 30
-      ? ['抖动健康', 'good']
-      : jit < 80
-        ? ['偶尔会卡', 'warn']
-        : ['环境不稳', 'bad'];
-  verdictEl.textContent = verdict[0];
-  verdictEl.className = `verdict ${verdict[1]}`;
-}
-
-/* ---------------- 延迟曲线 ---------------- */
-
-function drawSpark() {
-  const ctx = sparkEl.getContext('2d');
-  if (!ctx) return;
-  const dpr = Math.min(devicePixelRatio, 2);
-  // 用 CSS 像素当坐标系，backing store 按 dpr 放大：
-  // 这样画布尺寸和样式表里写的高度永远一致，改 CSS 不用同步改 JS
-  const w = sparkEl.clientWidth;
-  const h = sparkEl.clientHeight;
-  if (!w || !h) return;
-  if (sparkEl.width !== Math.round(w * dpr) || sparkEl.height !== Math.round(h * dpr)) {
-    sparkEl.width = Math.round(w * dpr);
-    sparkEl.height = Math.round(h * dpr);
-  }
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.clearRect(0, 0, w, h);
-
-  const vals = latency.values.slice(-120);
-  if (vals.length < 2) return;
-
-  const maxV = Math.max(40, ...vals) * 1.15;
-  const x = (i: number) => (i / (vals.length - 1)) * (w - 8) + 4;
-  const y = (v: number) => h - 6 - (v / maxV) * (h - 14);
-
-  // 100ms 红线：超过它，玩家会归因为「我打空了」
-  if (maxV > 100) {
-    ctx.strokeStyle = '#f09595';
-    ctx.setLineDash([4, 4]);
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(0, y(100));
-    ctx.lineTo(w, y(100));
-    ctx.stroke();
-    ctx.setLineDash([]);
-  }
-
-  ctx.strokeStyle = '#185fa5';
-  ctx.lineWidth = 1.6;
-  ctx.lineJoin = 'round';
-  ctx.beginPath();
-  vals.forEach((v, i) => (i === 0 ? ctx.moveTo(x(i), y(v)) : ctx.lineTo(x(i), y(v))));
-  ctx.stroke();
-
-  const p50 = latency.p50;
-  if (Number.isFinite(p50)) {
-    ctx.strokeStyle = 'rgba(15,110,86,0.55)';
-    ctx.setLineDash([3, 3]);
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(0, y(p50));
-    ctx.lineTo(w, y(p50));
-    ctx.stroke();
-    ctx.setLineDash([]);
-  }
-}
-
-/* ---------------- 启动 ---------------- */
-
-async function boot() {
-  roomEl.textContent = room;
-  const { url, insecure } = await resolveControllerUrl();
-  urlEl.textContent = url.replace(/^https?:\/\//, '');
-  urlEl.title = url;
-
-  const warn = $<HTMLParagraphElement>('proto-warn');
-  if (insecure) {
-    warn.hidden = false;
-    warn.textContent =
-      `当前是 HTTP 模式，手机浏览器不会把传感器交给网页。真机测试请改用 npm run dev:https，` +
-      `并在 https://localhost:${location.port ? Number(location.port) + 1 : 5184} 打开本页。`;
-  }
-
-  await QRCode.toCanvas(qrEl, url, {
-    width: 336,
-    margin: 1,
-    errorCorrectionLevel: 'M',
-    color: { dark: '#1c1c1a', light: '#ffffff' },
-  });
-  qrEl.style.width = '168px';
-  qrEl.style.height = '168px';
-
-  $<HTMLButtonElement>('copy-url').onclick = async () => {
-    try {
-      await navigator.clipboard.writeText(url);
-      $<HTMLButtonElement>('copy-url').textContent = '已复制';
-      setTimeout(() => ($<HTMLButtonElement>('copy-url').textContent = '复制'), 1200);
-    } catch {
-      /* 非安全上下文拿不到剪贴板权限，忽略 */
-    }
-  };
-
-  link = new Link(room, 'host', {
-    onState: setLinkState,
-    onImu: (buf) => onPacket(decodePacket(buf)),
-    onCtrl,
-  });
-
-  setInterval(() => link?.sendCtrl({ t: 'ping', t0: performance.now() }), 700);
-  setInterval(updateHud, 200);
-  setInterval(drawSpark, 140);
-}
-
-/* ---------------- 走位 ---------------- */
+/* ---------------- 发球辅助 ---------------- */
 
 /**
- * 站位。刻意和球拍姿态完全分开。
- *
- * 姿态来自手机（绝对朝向），位置来自脚本或键盘（相对速度）——两者混在一个输入里，
- * 「举着手机往右倾」就会同时想改朝向和位置，手感会互相打架。
- *
- * 为什么必须有它：严格碰撞上线后，可击球面积就是真实的 30×38cm 拍面，
- * 而球回来的横向落点是 ±1 米级别。拍子不能平移的话，命中率只有两成左右，
- * 玩家会觉得「这游戏判定有问题」，而实际上是「你站着没动」。
- *
- * 两路输入，优先级 键盘 > 自动：自动走位是默认那一路（`core/auto-move.ts`
- * 预测来球穿过击球面时的位置，把玩家按限速搬过去），键盘按下去时它整帧让位——
- * 手动永远优先，松手才接回来。玩家这一侧只负责挥拍。
- */
-const PLAYER = {
-  x: AUTO_MOVE_DEFAULTS.homeX,
-  y: RACKET_POS[1],
-  z: AUTO_MOVE_DEFAULTS.homeZ,
-  /** 手动走位速度。和自动走位同一档：手动不该比自动更慢，否则按键跑位必然漏球。 */
-  speed: AUTO_MOVE_DEFAULTS.speed,
-  /** 手动前后移动速度。和 `AUTO_MOVE_DEFAULTS.speedZ` 同源：倒退总比横移慢。 */
-  speedZ: AUTO_MOVE_DEFAULTS.speedZ,
-  // 站位范围只在 `AUTO_MOVE_DEFAULTS` 里定义一次：自动走位要按同一组边界选点，
-  // 两处各写一份迟早会漂。
-  maxX: AUTO_MOVE_DEFAULTS.maxX,
-  minZ: AUTO_MOVE_DEFAULTS.minZ,
-  maxZ: AUTO_MOVE_DEFAULTS.maxZ,
-  minY: AUTO_MOVE_DEFAULTS.minGripY,
-  maxY: AUTO_MOVE_DEFAULTS.maxGripY,
-};
-
-/** 自动走位的目标保持器。跨帧状态，和 `PLAYER` 一起在会话重置时清掉。 */
-const targetHold = new TargetHold();
-
-const held = new Set<string>();
-
-function updatePlayer(dt: number) {
-  // 发球站位优先于一切输入：发球是**站位固定**的动作，一边跑一边发不是网球。
-  // `Duel` 也按同一个位姿判「站好了没有」（`playerAtStance`），所以这里搬到哪儿、
-  // 判定就认哪儿——两处用的是同一个 `PLAYER`，不另算一份。
-  {
-    const sx = game.playerServeStanceX;
-    if (sx !== null) {
-      // 握点举到 `RACKET_POS[1] + 0.32`：发球的拍面在头上，而 `playerAtStance`
-      // 要求握点高过 `+0.25`。举拍是手臂动作，用 `speedY` 那一档，立刻到位。
-      const ty = Math.min(PLAYER.maxY, RACKET_POS[1] + 0.32);
-      PLAYER.x = stepAxis(PLAYER.x, sx, PLAYER.speed * dt, 0.02);
-      PLAYER.z = stepAxis(PLAYER.z, SERVE_STAND_Z, PLAYER.speedZ * dt, 0.02);
-      PLAYER.y = stepAxis(PLAYER.y, ty, AUTO_MOVE_DEFAULTS.speedY * dt, 0.005);
-      scene.setRacketBase(PLAYER.x, PLAYER.y, PLAYER.z);
-      // 站位是有意的位移，不是自动走位追球：保持器得忘掉上一分的目标，
-      // 否则下一分开球的第一次追球会被 10cm 的死区吃掉。
-      targetHold.reset();
-      return;
-    }
-  }
-
-  let ax = 0;
-  let az = 0;
-  if (held.has('a') || held.has('arrowleft')) ax -= 1;
-  if (held.has('d') || held.has('arrowright')) ax += 1;
-  if (held.has('w') || held.has('arrowup')) az -= 1;
-  if (held.has('s') || held.has('arrowdown')) az += 1;
-
-  // 键盘优先：只要这一帧有方向键按下，自动走位就整帧不动。
-  // 不用「按住时暂停 N 毫秒」那种计时器——松手瞬间接回来，手感最直接。
-  if (ax !== 0 || az !== 0) {
-    const l = Math.hypot(ax, az);
-    const step = (PLAYER.speed * dt) / l;
-    PLAYER.x = Math.min(PLAYER.maxX, Math.max(-PLAYER.maxX, PLAYER.x + ax * step));
-    PLAYER.z = Math.min(PLAYER.maxZ, Math.max(PLAYER.minZ, PLAYER.z + az * step));
-    // 键盘手动走位不接管高度：人一旦自己动手，握点高度缓缓回到自然位，
-    // 免得「蹲着的时候按 D」变成蹲着横移（那不是玩家想要的动作）。
-    PLAYER.y = stepAxis(PLAYER.y, RACKET_POS[1], AUTO_MOVE_DEFAULTS.speedY * dt, 0.01);
-    // 第三个参数是**握点**高度。站位移动搬的是握点，姿态只由手机决定，
-    // 两者互不干扰。
-    scene.setRacketBase(PLAYER.x, PLAYER.y, PLAYER.z);
-    return;
-  }
-
-  if (!autoMove) return;
-
-  // 自动走位：目标 = 让**拍面中心**落到球的弹道上，x 与 z 一起挪。
-  // x 补偿握法偏移（横握时中心在握点侧方半米），z 决定「球到面时的高度」——
-  // 只调 x 的话，球高了低了都只能干看着。
-  const cfg = AUTO_MOVE_DEFAULTS;
-  const state: AutoMoveState = { x: PLAYER.x, y: PLAYER.y, z: PLAYER.z, center: planOffset };
-  const plan = planAutoMove(game.ball, state, cfg);
-  // 规划器每帧重选平面，相邻候选的代价几乎相等时会来回跳 6cm——那就是
-  // 「击球前拍子抖一下」。保持器把 10cm 以内的改主意吃掉，见 `TargetHold`。
-  const tg = targetHold.resolve(plan, performance.now());
-  // 限速步进 + 边界 + 高度两段（预位 / 精确对位）都在 `stepAutoMove` 里，
-  // 探针跑的是同一个函数——见 `docs/testing.md` 8.4 那条「别在探针里再抄一份」。
-  const next = stepAutoMove(PLAYER, plan, tg, dt, cfg);
-  PLAYER.x = next.x;
-  PLAYER.y = next.y;
-  PLAYER.z = next.z;
-  scene.setRacketBase(PLAYER.x, PLAYER.y, PLAYER.z);
-}
-
-/* ---------------- 主循环 ---------------- */
-
-let lastFpsAt = performance.now();
-let lastFrame = performance.now();
-/**
- * 最近一帧的球拍位姿。HUD 的「拍面」读数用它。
- *
- * 这个数字回答的是「握持偏了多少度」：系统把手机的姿态直接当成拍面的姿态
- * （见 core/attitude.ts 的说明），而手机在手里的角度和你脑子里的拍面并不重合。
- * 因为出球方向有 72% 来自拍面法线，这个偏角会被放大 0.71 倍打到球的飞行方向上——
- * 偏 10°，十米外就差 1.2 米，玩家感觉到的就是「手感不对」而不是「我握歪了」。
- * 静止持拍、拍面正对球场时，这个数应该接近 0。
- */
-let lastPose: ReturnType<PlayScene['syncRacket']> | null = null;
-
-/**
- * 发球辅助：地面上的发球区 + 拍面指向的落点圈。
+ * 地面上的发球区 + 拍面指向的落点圈。
  *
  * 只在**发球这一刻**显示（`setup` / `toss` / 球还没第一次落地）。相持中把地板
  * 染一块绿会抢视觉，而发球恰恰是唯一「必须落进某个格子」的球，提示要给在这里。
@@ -996,18 +324,27 @@ function updateServeAid() {
   scene.setServeAim(aim.point, aim.inBox);
 }
 
+/* ---------------- 主循环 ---------------- */
+
 function loop() {
   const now = performance.now();
   const dt = Math.min((now - lastFrame) / 1000, 0.05);
   lastFrame = now;
 
-  updatePlayer(dt);
+  rig.step({
+    dt,
+    now,
+    serveStanceX: game.playerServeStanceX,
+    ball: game.ball,
+    keys: held,
+    sink: scene,
+  });
   // 顺序不能换：先把球拍的平滑推进到这一刻并取位姿，再做击球判定，最后渲染球。
   // 反过来（先判定再平滑）判定拿到的是上一帧的姿态，快速挥拍时会偏几十度，
   // 表现就是「明明挥到了却判空」——而且是越用力越容易空，最难查的那种。
   lastPose = scene.syncRacket(now, dt);
-  // 用**这一帧**的姿态估计握法偏移（自动走位下一帧用，滞后一帧对 0.4s 的低通无感）。
-  updateCenterOffset(lastPose, dt);
+  // 用**这一帧**的姿态估计握法偏移（自动走位下一帧用，滞后一帧对 0.4s 的低通无感）
+  rig.trackPose(lastPose, dt);
   game.pushRacket(lastPose);
   // 对手的拍子画在它判定用的那个位姿上。顺序同样不能反：先定这一帧的位姿，
   // 再推进物理，最后渲染——否则屏幕上对手的拍子比判定晚一帧到位。
@@ -1027,59 +364,50 @@ function loop() {
   requestAnimationFrame(loop);
 }
 
+/* ---------------- 键位 ---------------- */
+
 addEventListener('keydown', (e) => {
   const k = e.key.toLowerCase();
   held.add(k);
   if (k === 'm') {
     if (mock.running) {
       mock.stop();
-      linkStateEl.textContent = '模拟控制器已关闭';
+      panel.setNote('模拟控制器已关闭');
     } else {
       mock.start((p) => onPacket(p));
-      linkStateEl.textContent = '本地模拟控制器运行中（不经过网络）';
+      panel.setNote('本地模拟控制器运行中（不经过网络）');
     }
   }
   if (k === 'r') {
-    latency.clear();
-    endToEnd.clear();
-    packets.reset();
-    peakG = 0;
-    peakW = 0;
+    // 只清统计与峰值，**不动**时钟同步：连接还是同一条
+    session.resetStats();
     // 顺带让手机重新锁一次姿态基准：发现拍子和手机歪了，按 R 就能回正
     link?.sendCtrl({ t: 'recal' });
     // 采集也跟着换段：重标定之后 `yawZero` 变了，跨段混算等于把漂移学成走位偏差
-    nextContactSession();
-    flashHint('统计已重置 · 姿态重标定 · 采集换段');
+    recorder.nextSession();
+    hud.flashHint('统计已重置 · 姿态重标定 · 采集换段');
   }
-  if (k === 'l' && !e.repeat) {
-    if (contactLog.recording) {
-      contactLog.stop();
-      flashHint(`已暂停采集 · 攒了 ${contactLog.count} 条（按 K 导出）`);
-    } else {
-      contactLog.start();
-      flashHint(`开始采集（${contactSession}）· 打十几球后按 K 导出`);
-    }
-  }
-  if (k === 'k' && !e.repeat) downloadContactLog();
+  if (k === 'l' && !e.repeat) recorder.toggle();
+  if (k === 'k' && !e.repeat) void recorder.export();
   if (k === 'x') {
     sfx.unlock();
     sfx.setMuted(!sfx.isMuted);
-    flashHint(sfx.isMuted ? '静音' : '已开启声音');
+    hud.flashHint(sfx.isMuted ? '静音' : '已开启声音');
   }
   if (k === 'c') game.reset();
   if (k === 'g') {
     rigOn = !rigOn;
     scene.setRigEnabled(rigOn);
-    flashHint(rigOn ? '挥拍枢轴：开（绕腰/肘）' : '挥拍枢轴：关（绕拍柄底部）');
+    hud.flashHint(rigOn ? '挥拍枢轴：开（绕腰/肘）' : '挥拍枢轴：关（绕拍柄底部）');
   }
   if (k === 'z') {
     // 近景/全景：判断「球打在框上还是线上」要贴近，看整场要退开，一张图给不了两个答案
     const p = scene.toggleCamera();
-    flashHint(p === 'near' ? '近景 · 看得清拍面' : '全景 · 看得见来球');
+    hud.flashHint(p === 'near' ? '近景 · 看得清拍面' : '全景 · 看得见来球');
   }
   if (k === 'f') {
-    autoMove = !autoMove;
-    flashHint(autoMove ? '自动走位已开：只要挥拍' : '自动走位已关：A/D 手动跑位');
+    rig.autoMove = !rig.autoMove;
+    hud.flashHint(rig.autoMove ? '自动走位已开：只要挥拍' : '自动走位已关：A/D 手动跑位');
   }
   // 浏览器要求用户手势之后才能出声
   sfx.unlock();
@@ -1094,7 +422,30 @@ addEventListener('pointerdown', () => sfx.unlock(), { once: true });
 addEventListener('beforeunload', () => {
   mock.stop();
   link?.close();
+  recorder.beacon();
 });
+
+/* ---------------- 启动 ---------------- */
+
+function hudState(): hud.HudState {
+  return { game, session, fps, lastPose, lastSpeed, lastShot };
+}
+
+async function boot() {
+  await panel.render();
+
+  link = new Link(panel.room, 'host', {
+    onState: (s, d) => panel.setState(s, d),
+    onImu: (buf) => onPacket(decodePacket(buf)),
+    onCtrl,
+  });
+
+  setInterval(() => link?.sendCtrl({ t: 'ping', t0: performance.now() }), 700);
+  setInterval(() => hud.updateHud(hudState()), 200);
+  setInterval(() => drawSpark(sparkEl, session.oneWay), 140);
+  // 采集兜底：阈值是 8 条，但如果只打了三四球就停手，这 10 秒一到也照样落盘
+  setInterval(() => void recorder.flush(), 10_000);
+}
 
 /**
  * 启动。由 `main.ts` 调用一次。
@@ -1103,7 +454,7 @@ addEventListener('beforeunload', () => {
  * 三个分支（场景 / 规则对象 / HUD 主数字）都要在那里分叉——现在都塌掉了。
  */
 export function startPlay() {
-  scene = new PlayScene(canvas);
+  scene = new PlayScene(document.getElementById('scene') as HTMLCanvasElement);
   scene.setRigEnabled(rigOn);
   game = new Duel(liveStroke);
 
@@ -1114,6 +465,7 @@ export function startPlay() {
   if (subLabel) subLabel.textContent = '局';
 
   // 尺寸与 resize 监听在 PlayScene 的构造函数里就装好了，这里不要重复挂。
+  recorder.badge();
   void boot();
   loop();
 }

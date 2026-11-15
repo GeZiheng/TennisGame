@@ -488,6 +488,15 @@ export class TargetHold {
     private readonly settleMs = 250,
   ) {}
 
+  /**
+   * 实际生效的保持半径。采集要把它记进每条样本——它是残差里「按设计没动」的那一截，
+   * 参数一改，老数据的残差就不能直接和新数据比。给访问器而不是让调用方读 `HOLD_R`，
+   * 是因为构造时可以传入别的值（探针里就有）。
+   */
+  get radius(): number {
+    return this.holdR;
+  }
+
   resolve(plan: AutoMovePlan, now: number): MoveTarget {
     if (plan.chasing) this.lastChaseAt = now;
     const want: MoveTarget = { x: plan.target, y: plan.targetY, z: plan.targetZ };

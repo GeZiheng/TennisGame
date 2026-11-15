@@ -4,6 +4,8 @@ dist/
 # 随手丢在根目录的 .tmp-scan.cjs 会直接进版本库（11-15 踩过）。
 .tmp-*
 .cert/
+# 击球采集的样本：真机数据，不进版本库。目录本身用 .gitkeep 保留。
+data/contact/*.jsonl
 *.log
 .DS_Store
 .workbuddy/

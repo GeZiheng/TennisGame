@@ -1,5 +1,5 @@
 /**
- * 走位抖动探针：复刻 `app.ts` 的 `updatePlayer`（`planAutoMove` → `TargetHold` → `stepAxis`），
+ * 走位抖动探针：复刻 `play/player.ts` 的 `PlayerRig.step`（`planAutoMove` → `TargetHold` → `stepAutoMove`），
  * 逐帧记握点与目标，量「球到面前 300ms」里人到底在不在抖。
  *
  * 为什么需要它：抖动不是渲染问题，是**规划器每帧重新选平面**的结果——相邻两条候选

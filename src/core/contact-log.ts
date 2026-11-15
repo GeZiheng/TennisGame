@@ -89,7 +89,19 @@ export interface ContactCapture {
   lag: number | null;
   /** 挥出去那一拍；没挥 = null */
   stroke: StrokeTrace | null;
-  /** 发球那一拍。采集时排除：它是举在头上打的，和地面击球不是同一类动作 */
+  /**
+   * 这一拍是不是**发球动作**（把抛起的球打出去那一刻）。
+   *
+   * **当前恒为 `false`，而且是不变的**：发球走 `Duel.tickToss` 里独立的
+   * `tossContact` 判定，根本不经过 `enterContact` / `watchNearMiss`，所以一条发球
+   * 样本都不会产生。字段留着是当护栏——万一以后有人把发球接进统一采集，这里就是
+   * 唯一的过滤依据（见 `usableForCalibration`）。
+   *
+   * 排除发球是一条**定下来的规则**，不是暂时没做：抛球点与击球区已经锚在握点上、
+   * 顶点 3.43m（`docs/history.md` 4.25），真机反馈「位置已经合适」，不需要校准。
+   * 而且它是举在头上打的，和地面击球的杆向量分布完全不同，混进来只会把地面击球的
+   * 均值带偏。
+   */
   serve: boolean;
 }
 
@@ -131,7 +143,10 @@ export interface ContactSample {
     hit: boolean;
     /** 球是否被挥出去了 */
     swung: boolean;
-    /** 发球样本标记为 true，建模时整条剔除 */
+    /**
+     * 发球动作标记。**正常采集下恒为 false**（发球不产生样本，见 `ContactCapture.serve`），
+     * 建模时按「不是训练数据」整条剔除。
+     */
     serve: boolean;
     /** 归一化偏离甜区 */
     offCenter: number;
@@ -141,6 +156,34 @@ export interface ContactSample {
     sincePrevHit: number | null;
     /** 采集时的姿态漂移读数（度）。超阈值的整段丢弃，见 `AGENTS.md` 0.4 */
     driftDeg: number | null;
+    /**
+     * 相遇那一刻喂给 `planAutoMove` 的瞄准点（`restOffset + contactDelta`）。
+     *
+     * **不进特征**——它和 `G` 是同一个东西的两种形式，喂进去就是闭环自激。
+     * 记它是为了**事后还原「当时瞄的是哪」**：没有它就只能靠 `offCenter` 反推，
+     * 而 `offCenter` 是判定层的三维距离、已经混进了挥拍那一份，拆不开。
+     *
+     * 必须是相遇**之前**的快照：命中后手感学习会把握点往这一拍扫出去的位置收
+     * （`PlayerRig.learn`），取晚一拍记到的就是「学完之后」的值，残差会凭空变小。
+     */
+    planOffset: V3;
+    /**
+     * 当帧生效的 `TargetHold.holdR`（米）。
+     *
+     * 它是「允许的静差上界」，也是残差里**不该**算作走位误差的那一部分：
+     * 站位停在离理想点 `holdR` 以内都算「按设计没动」。参数改过之后，老数据的
+     * 残差就不能直接和新数据比，所以必须逐条记下来。
+     */
+    holdR: number;
+    /** 当帧生效的 `stepAxis` 死区（米）。同上：它是残差里「按设计不动」的那一截。 */
+    deadband: number;
+    /**
+     * 竖直轴的死区（米），比 `deadband` 小（0.02 vs 0.05）。
+     *
+     * 必须单独记：`stepAutoMove` 对 y 用的是 `deadbandY`。只记一个 `deadband`
+     * 的话，事后拿 0.05 去减 y 分量会**减多**，把「设计允许的静差」算成负数。
+     */
+    deadbandY: number;
   };
 }
 
@@ -150,6 +193,12 @@ export interface ContactSampleInput {
   grip: V3;
   /** `restOffset` 快照。必须取相遇前的值，不能用事后被低通改过的 */
   rest: V3;
+  /** 相遇前的瞄准点快照（`PlayerRig.aim`）。同上，不能取学习改完之后的值 */
+  planOffset: V3;
+  /** 当帧生效的保持半径与死区，直接来自走位配置，不要在这里算 */
+  holdR: number;
+  deadband: number;
+  deadbandY: number;
   capture: ContactCapture;
   rally: number;
   sincePrevHit: number | null;
@@ -202,11 +251,63 @@ export function buildContactSample(input: ContactSampleInput): ContactSample {
       rally: input.rally,
       sincePrevHit: input.sincePrevHit,
       driftDeg: input.driftDeg,
+      planOffset: cp(input.planOffset),
+      holdR: input.holdR,
+      deadband: input.deadband,
+      deadbandY: input.deadbandY,
     },
   };
 }
 
-/** 一条样本是否该进校准器的训练集。发球排除；其余（含漏接）全留。 */
+/**
+ * 瞄准残差：这一拍实际扫出去的杆向量，减掉「当时走位以为会扫出去的那一份」。
+ *
+ * ## 它为什么正好等于「拍面中心偏离球的距离」
+ *
+ * 走位把握点放在 `G = p − planOffset`（`p` 是球穿过击球面的点）。相遇那一刻拍面
+ * 中心在 `fc = G + rest + delta`，所以
+ *
+ * ```
+ * fc − p = delta + planOffset − rest = delta − (planOffset − rest)
+ * ```
+ *
+ * `planOffset − rest` 就是 `contactDelta`（当时估的那一份），于是残差
+ * `= delta_真实 − delta_估`。**左边 `fc − p` 是判定层看到的那条距离，右边是这个
+ * 函数**——所以这份残差可以直接和判定半轴（横 0.20 / 竖 0.24）对比，不需要换算。
+ *
+ * ## 它和 `offCenter` 的分工
+ *
+ * `offCenter` 是判定层的三维距离，还要混进挥拍带来的那一份，**拆不开**。残差只含
+ * 「估计误差 + 走位执行误差」，是「校准器还能修多少」的直接读数。
+ *
+ * ## 残差里有两块是设计允许的
+ *
+ * 站位停在 `holdR`（0.14）以内、且小于死区的偏差是**按设计不动**的，不是走位错。
+ * 判断「走位本身准不准」要减掉这一截，别拿总残差当误差。注意死区分轴：x / z 是
+ * `deadband`（0.05），y 是 `deadbandY`（0.02）——拿 0.05 去减 y 会减多。
+ *
+ * 旧样本（11-15 之前）没有 `planOffset`，返回 `null`。
+ */
+export function aimResidual(s: ContactSample): V3 | null {
+  const po = s.meta.planOffset;
+  if (!po) return null;
+  return sub(s.label.delta, sub(po, s.label.rest));
+}
+
+/**
+ * 一条样本是否该进校准器的训练集。
+ *
+ * **只有一条排除规则：发球不算。** 理由见 `ContactCapture.serve`——抛球位置 4.25 已
+ * 定稿、不需要修正，而且发球是举在头上打的，杆向量分布和地面击球不是一回事，混进来
+ * 会把地面击球的均值带偏。
+ *
+ * 漏接（`hit: false`）和「碰到没挥」（`swung: false`）**必须留**：只留命中的会引入
+ * 截断偏置，估出来的均值必然偏小，正好把要修的那个偏差抹掉。
+ *
+ * 注意这个函数现在有点「防呆」性质：发球根本不产生 `contact` 事件（走 `tickToss`），
+ * 所以 `serve` 恒为 false。留着这条判断，是为了让「发球不进训练集」这条规则**在代码
+ * 里可读、可测**，而不是依赖「发球恰好走了另一条路径」这个实现细节。
+ */
 export function usableForCalibration(s: ContactSample): boolean {
   return !s.meta.serve;
 }

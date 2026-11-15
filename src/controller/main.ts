@@ -1,7 +1,9 @@
-import { ImuTracker, qConj, qMul, qNormalize, IDENTITY, type Quat } from '../core/imu';
+import { ImuTracker, qconj, qmul, qnorm, IDENTITY, type Quat } from '../core/imu';
 import { isYawGimbal, qYaw, toOutputQuat, YawDriftObserver, PoseContinuityGate } from '../core/attitude';
 import { MotionSource, DemoSource, type SampleSource } from './sensors';
-import { diagnose, noEventsIssue, isFatal, type EnvFacts, type EnvIssue } from './env';
+import { diagnose, isFatal, type EnvFacts, type EnvIssue } from './env';
+import { initGate, showNoEvents } from './gate';
+import { drawAxes } from './axes';
 import { Link, type LinkState } from '../net/link';
 import { SWING_THRESHOLD } from '../core/court';
 import {
@@ -14,16 +16,11 @@ import {
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
+// 「开始之前」那一屏（诊断卡片 / 复制链接 / 演示入口）归 `gate.ts`，这里只留
+// 主流程自己会改的那几个节点。
 const gate = $<HTMLDivElement>('gate');
-const gateTitle = $<HTMLHeadingElement>('gate-title');
-const gateHint = $<HTMLParagraphElement>('gate-hint');
-const gateDiag = $<HTMLDivElement>('gate-diag');
 const gateMsg = $<HTMLParagraphElement>('gate-msg');
 const gateActions = $<HTMLDivElement>('gate-actions');
-const gateFacts = $<HTMLParagraphElement>('gate-facts');
-const gateUrl = $<HTMLInputElement>('gate-url');
-const copyBtn = $<HTMLButtonElement>('copy-link');
-const demoBtn = $<HTMLButtonElement>('demo-btn');
 const startBtn = $<HTMLButtonElement>('start');
 const running = $<HTMLDivElement>('running');
 const connPill = $<HTMLSpanElement>('conn-pill');
@@ -112,86 +109,7 @@ const env: { facts: EnvFacts | null; issues: EnvIssue[] } = demo
   ? { facts: null, issues: [] }
   : diagnose();
 
-function renderDiag(issues: EnvIssue[]) {
-  gateDiag.textContent = '';
-  if (issues.length === 0) {
-    gateDiag.hidden = true;
-    return;
-  }
-  gateDiag.hidden = false;
-  for (const issue of issues) {
-    const card = document.createElement('div');
-    card.className = 'diag-card';
-
-    const title = document.createElement('div');
-    title.className = 'diag-title';
-    title.textContent = issue.title;
-
-    const detail = document.createElement('p');
-    detail.className = 'diag-detail';
-    detail.textContent = issue.detail;
-
-    const steps = document.createElement('ol');
-    steps.className = 'diag-steps';
-    for (const s of issue.steps) {
-      const li = document.createElement('li');
-      li.textContent = s;
-      steps.append(li);
-    }
-
-    card.append(title, detail, steps);
-    gateDiag.append(card);
-  }
-}
-
-function renderFacts(f: EnvFacts) {
-  const mark = (ok: boolean) => (ok ? '✓' : '✗');
-  const who = f.inApp ?? (f.isIOS ? 'iOS' : f.isAndroid ? 'Android' : '桌面浏览器');
-  gateFacts.textContent = `安全上下文 ${mark(f.secure)} · DeviceMotion ${mark(f.hasMotion)} · ${who}`;
-  const good = f.secure && f.hasMotion && !f.inApp;
-  gateFacts.className = `gate-facts ${good ? 'ok' : 'bad'}`;
-}
-
-async function copyCurrentUrl() {
-  const url = location.href;
-  try {
-    await navigator.clipboard.writeText(url);
-  } catch {
-    // http 页面拿不到剪贴板权限，退回 execCommand；还不行就靠用户长按输入框
-    try {
-      gateUrl.select();
-      gateUrl.setSelectionRange(0, url.length);
-      document.execCommand('copy');
-    } catch {
-      /* 让用户手动长按复制，下面会有提示 */
-    }
-  }
-  copyBtn.textContent = '已复制，去浏览器粘贴';
-  setTimeout(() => (copyBtn.textContent = '复制链接'), 2200);
-}
-
-const facts = env.facts;
-if (facts) {
-  renderFacts(facts);
-  renderDiag(env.issues);
-  gateUrl.value = location.href;
-
-  if (isFatal(env.issues)) {
-    // 确定拿不到数据的情况下，别让人白点一次按钮
-    gateTitle.textContent = '这个环境拿不到传感器';
-    gateHint.hidden = true;
-    startBtn.hidden = true;
-    gateActions.hidden = false;
-  }
-}
-
-copyBtn.addEventListener('click', copyCurrentUrl);
-
-demoBtn.addEventListener('click', () => {
-  const u = new URL(location.href);
-  u.searchParams.set('demo', '1');
-  location.replace(u.toString());
-});
+initGate(env);
 
 /* ---------------- 传感器 ---------------- */
 
@@ -215,10 +133,9 @@ source.onSample = (s) => {
 };
 
 source.onError = (msg) => {
-  gateMsg.textContent = msg;
-  if (env.facts) renderDiag([...env.issues.filter((i) => i.id !== 'no-events'), noEventsIssue(env.facts)]);
+  showNoEvents(env, msg);
   gateActions.hidden = false;
-  gateUrl.value = location.href;
+  $<HTMLInputElement>('gate-url').value = location.href;
   startBtn.disabled = false;
   startBtn.textContent = '重试';
 };
@@ -228,8 +145,8 @@ source.onError = (msg) => {
 /** 方向事件中断 / 跳变期间，用陀螺积分的增量顶上；恢复后由绝对姿态接管。 */
 function extrapolate(): Quat {
   if (!extrapBase || !trackerAtBase) return tracker.relativeTo(origin);
-  const delta = qMul(qConj(trackerAtBase), tracker.snapshot()); // 设备系增量
-  return qNormalize(qMul(extrapBase, delta));
+  const delta = qmul(qconj(trackerAtBase), tracker.snapshot()); // 设备系增量
+  return qnorm(qmul(extrapBase, delta));
 }
 
 /**
@@ -358,7 +275,7 @@ function startUiLoop() {
     // 排障时这一条决定了是去查传感器还是去查别的地方
     flagGyro.classList.toggle('on', source.gyroSource === 'diff');
 
-    drawAxes();
+    drawAxes(axesEl, currentOut());
   };
 
   tick();
@@ -387,80 +304,6 @@ function startUiLoop() {
       `漂移 ${d >= 0 ? '+' : ''}${d.toFixed(1)}°${driftOn ? ' · 补偿开' : ''}${gimbal ? ' · 万向锁' : ''}`;
     driftToggleEl.className = `rate ${driftOn ? 'good' : Math.abs(d) > 20 ? 'warn' : ''}`;
   }, 1000);
-}
-
-/* ---------------- 姿态示意 ---------------- */
-
-function rotateVec(q: Quat, v: [number, number, number]): [number, number, number] {
-  const [qx, qy, qz, qw] = q;
-  const tx = 2 * (qy * v[2] - qz * v[1]);
-  const ty = 2 * (qz * v[0] - qx * v[2]);
-  const tz = 2 * (qx * v[1] - qy * v[0]);
-  return [
-    v[0] + qw * tx + (qy * tz - qz * ty),
-    v[1] + qw * ty + (qz * tx - qx * tz),
-    v[2] + qw * tz + (qx * ty - qy * tx),
-  ];
-}
-
-function drawAxes() {
-  const ctx = axesEl.getContext('2d');
-  if (!ctx) return;
-  const dpr = Math.min(devicePixelRatio, 2);
-  if (axesEl.width !== Math.round(axesEl.clientWidth * dpr)) {
-    axesEl.width = Math.round(axesEl.clientWidth * dpr);
-    axesEl.height = Math.round(axesEl.clientWidth * dpr);
-  }
-  const w = axesEl.width;
-  const h = axesEl.height;
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.clearRect(0, 0, w, h);
-
-  const cx = w / 2;
-  const cy = h / 2;
-  const s = w * 0.36;
-  const q = currentOut();
-
-  const project = (v: [number, number, number]) => {
-    const r = rotateVec(q, v);
-    return { x: cx + r[0] * s, y: cy - r[1] * s, z: r[2] };
-  };
-
-  // 参考圆
-  ctx.strokeStyle = 'rgba(28,28,26,0.08)';
-  ctx.lineWidth = 1 * dpr;
-  ctx.beginPath();
-  ctx.arc(cx, cy, s, 0, Math.PI * 2);
-  ctx.stroke();
-
-  const axes: Array<[ [number, number, number], string ]> = [
-    [[0, 1, 0], '#0f6e56'], // 拍柄方向
-    [[0, 0, 1], '#185fa5'], // 拍面法线
-    [[1, 0, 0], '#d85a30'], // 侧向
-  ];
-
-  for (const [dir, color] of axes) {
-    const p = project(dir);
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 2.5 * dpr;
-    ctx.lineCap = 'round';
-    ctx.globalAlpha = 0.35 + 0.65 * Math.max(0, Math.min(1, (p.z + 1) / 2));
-    ctx.beginPath();
-    ctx.moveTo(cx, cy);
-    ctx.lineTo(p.x, p.y);
-    ctx.stroke();
-    ctx.globalAlpha = 1;
-
-    ctx.fillStyle = color;
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, 4 * dpr, 0, Math.PI * 2);
-    ctx.fill();
-  }
-
-  ctx.fillStyle = 'rgba(28,28,26,0.55)';
-  ctx.beginPath();
-  ctx.arc(cx, cy, 3 * dpr, 0, Math.PI * 2);
-  ctx.fill();
 }
 
 /* ---------------- 启动 ---------------- */

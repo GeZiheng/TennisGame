@@ -9,7 +9,8 @@
 ```
 src/core/            不依赖 three.js / DOM，可在 Node 里直接单测
   court.ts           场地尺寸 + 所有手感常量（调参唯一入口）
-  vec.ts             V3 / Quat4 数学（vrot 用 t = 2(q.xyz × v)）
+  quat.ts            四元数 (x,y,z,w) 的全部代数（唯一实现；`Quat` / `Quat4` 是它的别名）
+  vec.ts             V3 数学（vrot 用 t = 2(q.xyz × v)）
   attitude.ts        deviceorientation → 世界系四元数、朝向归零
   imu.ts             陀螺仪积分、静止冻结（ZUPT）、零偏 EMA
   gyro.ts            由两帧姿态差分反推角速度（rotationRate 不可用时的兜底）
@@ -24,12 +25,21 @@ src/core/            不依赖 three.js / DOM，可在 Node 里直接单测
   auto-move.ts       玩家侧自动走位（三维选点 + 目标保持 + 限速步进）
   swing-rig.ts       挥拍枢轴（腰 → 肘 → 腰）
   protocol.ts        68 字节定长二进制包（兼容 60 字节旧格式）
+  stats.ts           延迟分位数 / 丢包 / 时钟同步（零 DOM，所以住在 core）
 src/net/link.ts      WebRTC 双通道（ctrl 可靠有序 / imu 不可靠无序）+ 信令客户端
-src/play/            大屏端：scene（three.js + glb 球拍）、audio、stats、mock、main
-src/controller/      手机端：sensors（双通道角速度）、env（环境自检）、main（发送循环）
+src/play/app.ts      大屏编排：主循环顺序 + 会话复位 + 键位（**只有这些**）
+src/play/player.ts   走位与瞄准偏移（握点、目标保持、学习到的击球补偿）
+src/play/session.ts  一次连接的状态：时钟、序号、延迟、峰值（换手机即作废）
+src/play/recorder.ts 击球采集：组装样本、增量落盘、导出
+src/play/scene.ts    画面：球拍平滑、挥拍枢轴、相机、特效（建模在 meshes/）
+src/play/meshes/     场地 / 球拍 / 对手 / 击球面的纯几何构造
+src/play/hud.ts      HUD 与提示条（只读状态、只写 DOM）
+src/play/spark.ts    延迟曲线，panel.ts 连接面板与二维码
+src/controller/      手机端：sensors（双通道角速度）、env（环境自检）、gate（开始前一屏）、
+                     axes（三分量示意）、main（姿态流水线 + 发送循环）
 server/              Vite 插件 + 信令房间 + /__lanip + /ca.crt
 scripts/             证书、单测跑手、端到端模拟、probe-* 诊断工具
-tests/core.test.cjs  155 项 / 26 分组（见 docs/testing.md）
+tests/core.test.cjs  158 项 / 26 分组（见 docs/testing.md）
 ```
 
 ---
@@ -232,8 +242,9 @@ live --(落地 / 撞网 / 飞出范围)--> point --> wait
 ## 3.9 主循环顺序（不能换）
 
 ```ts
-updatePlayer(dt);                              // 走位：键盘优先，否则自动
+rig.step({ dt, now, serveStanceX, ball, keys, sink: scene });  // 走位：站位 > 键盘 > 自动
 lastPose = scene.syncRacket(now, dt);          // 先平滑球拍并取位姿
+rig.trackPose(lastPose, dt);                   // 用这一帧的姿态估握法偏移（下一帧用）
 duel.pushRacket(lastPose);                     // 每一帧都要推
 for (const e of duel.update(dt, now)) handle(e);
 scene.setBall(duel.ball.p, duel.ball.spin);
@@ -242,10 +253,11 @@ scene.render(dt);
 
 先判定再平滑 → 拿到的是上一帧姿态，快速挥拍会偏几十度，越用力越容易空。
 
-### `updatePlayer` 里的两路走位
+### `PlayerRig.step` 里的两路走位
 
 `src/core/auto-move.ts` 只有三个纯函数（`planAutoMove` / `stepAxis` / `blendCenterOffset`），
-决策全在它里面，`app.ts` 只负责调用。输入只有两路，**键盘优先**：
+决策全在它里面；`src/play/player.ts` 的 `PlayerRig.step` 只负责按顺序调用并把结果喂给
+`setRacketBase`。输入只有两路，**键盘优先**：
 
 1. **键盘**（`WASD`）——这一帧只要有方向键按下，就整帧走键盘，自动走位让位。
 2. **自动**（默认）——`planAutoMove(ball, { x, y, z, center })` 给出握点目标 `(x, y, z)`。

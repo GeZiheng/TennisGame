@@ -315,6 +315,21 @@ button.primary:disabled {
   transform: none;
 }
 
+/* 采集状态常驻：默认就在采，所以必须一直看得见——否则「以为在采其实停了」 */
+.g-rec {
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--teal);
+  margin-top: 2px;
+  opacity: 0.85;
+}
+
+/* 暂停时降到灰色。不是隐藏：暂停本身就是要被看见的状态 */
+.g-rec.off {
+  color: var(--ink-3);
+}
+
 /* 链路诊断：只在需要排查延迟/丢包时抬头看一眼，所以做得小而平 */
 .linkpanel {
   position: fixed;

@@ -1,25 +1,13 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
-import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import type { Quat } from '../core/imu';
 import { type RacketPose } from '../core/racket';
 import { SwingRig } from '../core/swing-rig';
 import type { V3 } from '../core/vec';
-import {
-  HALF_WIDTH,
-  BASELINE_Z,
-  NET_Z,
-  SERVICE_Z,
-  OPP_BASELINE_Z,
-  OPP_HIT_Z,
-  BALL_RENDER_R,
-  HIT_Z,
-  FACE_CY,
-  FACE_RX,
-  FACE_RY,
-  RACKET_POS,
-} from '../core/court';
+import { BALL_RENDER_R, FACE_CY, RACKET_POS } from '../core/court';
+import { buildCourt, buildHitStrip } from './meshes/court';
+import { buildOpponent } from './meshes/opponent';
+import { buildMembrane, buildRacketMesh, loadRacketModel } from './meshes/racket';
 
 /** 屏幕上的特效（击球冲击环、落点圈）。用一个很小的对象池，避免每拍都新建几何体。 */
 interface Fx {
@@ -169,22 +157,26 @@ export class PlayScene {
     (key.shadow as any).intensity = 0.4;
     this.scene.add(key);
 
-    this.buildGround();
-    this.buildOpponent();
-    this.buildHitZone();
+    buildCourt(this.scene);
+    const opp = buildOpponent();
+    this.scene.add(opp.group);
+    this.oppRacket = opp.group;
+    this.oppGlow = opp.glow;
+    this.hitStrip = buildHitStrip();
+    this.scene.add(this.hitStrip);
 
     this.racket = new THREE.Group();
     // 初始位姿 = 参考握法（恒等姿态）：握点在 RACKET_POS，拍面中心在它正上方 FACE_CY
     this.racket.position.set(...RACKET_POS);
     // 拍面那层极淡的薄膜挂在组上，不归某个模型管：它解决的是「拍面读不出来」，
     // 和用哪支拍子无关，换模型时不该跟着丢。
-    this.racket.add(this.buildMembrane());
+    this.racket.add(buildMembrane());
     // 先挂程序化球拍，glb 到了再换掉。33KB 的本地文件通常几十毫秒就到，
     // 但网络慢、路径挂了、或者哪天 assets 被清掉时，屏幕上不能没有球拍——
     // 「空手站在场上」会被当成游戏坏了，而其实判定还在正常工作。
-    this.racket.add(this.buildRacket());
+    this.racket.add(buildRacketMesh());
     this.scene.add(this.racket);
-    this.loadRacketModel();
+    loadRacketModel(this.racket, this.renderer);
 
     this.racketGlow = new THREE.PointLight('#ffd9a0', 0, 3.2);
     this.racketGlow.position.set(...RACKET_POS);
@@ -216,118 +208,6 @@ export class PlayScene {
 
   /* ---------------- 静态场景 ---------------- */
 
-  private buildGround() {
-    const floor = new THREE.Mesh(
-      new THREE.PlaneGeometry(90, 90),
-      new THREE.MeshStandardMaterial({ color: '#d5dcd3', roughness: 1 })
-    );
-    floor.rotation.x = -Math.PI / 2;
-    floor.receiveShadow = true;
-    this.scene.add(floor);
-
-    const lineMat = new THREE.MeshStandardMaterial({ color: '#fbfbf8', roughness: 0.9 });
-    const seg = (x1: number, z1: number, x2: number, z2: number, w = 0.06) => {
-      const dx = x2 - x1;
-      const dz = z2 - z1;
-      const len = Math.hypot(dx, dz) + w;
-      const mesh = new THREE.Mesh(new THREE.BoxGeometry(len, 0.004, w), lineMat);
-      mesh.position.set((x1 + x2) / 2, 0.003, (z1 + z2) / 2);
-      mesh.rotation.y = Math.atan2(-dz, dx);
-      mesh.receiveShadow = true;
-      this.scene.add(mesh);
-    };
-
-    const W = HALF_WIDTH;
-    // 边线一直拉到对面底线，其余线条按球网镜像一份。整块场地 = 我这边 + 对面，
-    // 球网在中间——这不是「画两面墙」，是同一片场地的两半。
-    const zFar = OPP_BASELINE_Z;
-    const svc = 2 * NET_Z - SERVICE_Z;
-    seg(-W, BASELINE_Z, W, BASELINE_Z, 0.08); // 底线
-    seg(-W, BASELINE_Z, -W, zFar); // 单打边线
-    seg(W, BASELINE_Z, W, zFar);
-    seg(-W, SERVICE_Z, W, SERVICE_Z, 0.05); // 发球线
-    seg(0, SERVICE_Z, 0, NET_Z, 0.05); // 中央发球线
-    seg(-0.16, BASELINE_Z, 0.16, BASELINE_Z, 0.09); // 中点标记
-    seg(-W, OPP_BASELINE_Z, W, OPP_BASELINE_Z, 0.08);
-    seg(-W, svc, W, svc, 0.05);
-    seg(0, svc, 0, NET_Z, 0.05);
-    seg(-0.16, OPP_BASELINE_Z, 0.16, OPP_BASELINE_Z, 0.09);
-
-    // 网：用程序生成的网格纹理，比一块半透明色块更像网
-    const c = document.createElement('canvas');
-    c.width = 128;
-    c.height = 64;
-    const cx = c.getContext('2d')!;
-    cx.strokeStyle = 'rgba(74,80,72,0.6)';
-    cx.lineWidth = 1;
-    for (let i = 0; i <= 128; i += 8) {
-      cx.beginPath();
-      cx.moveTo(i + 0.5, 0);
-      cx.lineTo(i + 0.5, 64);
-      cx.stroke();
-    }
-    for (let j = 0; j <= 64; j += 8) {
-      cx.beginPath();
-      cx.moveTo(0, j + 0.5);
-      cx.lineTo(128, j + 0.5);
-      cx.stroke();
-    }
-    const netTex = new THREE.CanvasTexture(c);
-    netTex.wrapS = netTex.wrapT = THREE.RepeatWrapping;
-    netTex.repeat.set(5, 1);
-    netTex.anisotropy = 4;
-
-    const net = new THREE.Mesh(
-      new THREE.PlaneGeometry(W * 2, 0.9),
-      new THREE.MeshBasicMaterial({
-        map: netTex,
-        transparent: true,
-        side: THREE.DoubleSide,
-        depthWrite: false,
-        opacity: 0.85,
-      })
-    );
-    net.position.set(0, 0.45, NET_Z);
-    this.scene.add(net);
-
-    const band = new THREE.Mesh(
-      new THREE.BoxGeometry(W * 2 + 0.1, 0.06, 0.025),
-      new THREE.MeshStandardMaterial({ color: '#fbfbf8', roughness: 0.8 })
-    );
-    band.position.set(0, 0.9, NET_Z);
-    this.scene.add(band);
-
-    const postMat = new THREE.MeshStandardMaterial({ color: '#9aa198', roughness: 0.7 });
-    for (const px of [-W - 0.05, W + 0.05]) {
-      const post = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.035, 1.07, 12), postMat);
-      post.position.set(px, 0.535, NET_Z);
-      post.castShadow = true;
-      this.scene.add(post);
-    }
-  }
-
-  /**
-   * 对打模式下的对手（脚本回球机）。
-   *
-   * 只用程序化球拍，不加载 glb：那支模型是给玩家手里那支用的，对手在 20 米外，
-   * 细节全被雾和透视吃掉，多加载一份只会多一次可能失败的请求。
-   *
-   * 位姿每帧从 `Duel.machinePose()` 抄过来，和判定用的是**同一个** `RacketPose`
-   * ——否则又是一次「看着碰到了没打到」。
-   */
-  private buildOpponent() {
-    const g = new THREE.Group();
-    g.position.set(0, 1.0, OPP_HIT_Z);
-    g.add(this.buildRacket());
-    this.scene.add(g);
-    this.oppRacket = g;
-
-    const glow = new THREE.PointLight('#9ec7ff', 0.9, 4.5);
-    glow.position.set(0, 1.6, OPP_HIT_Z);
-    this.scene.add(glow);
-    this.oppGlow = glow;
-  }
-
   private oppGlow: THREE.PointLight | null = null;
 
   /** 抄一份对手位姿给渲染。每帧调用，参数就是判定层用的那份 pose。 */
@@ -339,244 +219,6 @@ export class PlayScene {
     if (this.oppGlow) {
       this.oppGlow.position.set(pose.pos[0], pose.pos[1] + FACE_CY, pose.pos[2]);
     }
-  }
-
-  /**
-   * 击球面：地上一条浅色横线，告诉玩家「球到这条线就该出手了」。
-   *
-   * 宽度跟着拍面走（约 1.4 个拍面宽），并且**跟着站位移动**。
-   * 原来画的是 2.9 米（旧击球框宽度），那还是「整条线都能打」时代的提示，
-   * 现在可击球面积只有 30cm 宽——画这么长等于在骗人往边上站。
-   */
-  private buildHitZone() {
-    const mat = new THREE.MeshBasicMaterial({
-      color: '#3aa07d',
-      transparent: true,
-      opacity: 0.22,
-      depthWrite: false,
-    });
-    this.hitStrip = new THREE.Mesh(new THREE.PlaneGeometry(FACE_RX * 2.8, 0.16), mat);
-    this.hitStrip.rotation.x = -Math.PI / 2;
-    this.hitStrip.position.set(0, 0.004, HIT_Z);
-    this.scene.add(this.hitStrip);
-  }
-
-  /**
-   * 网球拍。
-   *
-   * 之前那支是照着羽毛球拍做的：细拍杆（Ø2.2cm）、窄长小拍面、拍框管径只有 1.1cm、
-   * 没有喉部三角。网球拍的特征几乎全在反面——粗框、宽椭圆拍面、拍喉明显分叉、
-   * 握把更粗更长。所以这里按成人拍的真实比例重做：
-   *
-   *   总长 0.78m，拍面 31 × 37cm（原来 25 × 33cm，面积 +39%），框管 Ø2.6cm。
-   *
-   * 注意：拍面变大**不影响物理**。击球判定用的是时间窗（球穿过击球面的时刻 ± 150ms），
-   * 和拍面几何没有任何关系；`SWING_ARM` 也保持 0.68 不变，免得把已经调好的手感打乱。
-   */
-  /**
-   * 程序化兜底球拍。
-   *
-   * 只在 `models/racket.glb` 加载失败时露脸，所以它的取舍是「一定画得出来」，
-   * 不是「画得最好」：全部用 three 内置几何体拼，没有外部依赖、没有异步。
-   * 尺寸仍然按 FACE_* 常量来，这样就算兜底被顶上来，视觉和判定也是对齐的。
-   */
-  private buildRacket(): THREE.Group {
-    const g = new THREE.Group();
-    g.name = 'racket-fallback';
-
-    /* ---- 尺寸（米） ---- */
-    const gripLen = 0.212;
-    const gripR = 0.0215;
-    const headCY = 0.6; // 拍面中心
-    const rx = 0.148; // 半宽 → 拍面宽 30cm
-    const ry = 0.19; // 半长 → 拍面长 38cm（长宽比 1.28，接近真实 oversize 拍面）
-    const headBottom = headCY - ry;
-    const frameR = 0.013; // 框管半径，网球拍明显比羽毛球拍粗
-    const throatHalfX = 0.056;
-    const throatTop = headBottom + 0.004;
-
-    const frameMat = new THREE.MeshStandardMaterial({ color: '#2b3336', roughness: 0.3, metalness: 0.55 });
-    const accentMat = new THREE.MeshStandardMaterial({
-      color: '#0f6e56',
-      roughness: 0.45,
-      metalness: 0.25,
-      side: THREE.DoubleSide,
-    });
-    const gripMat = new THREE.MeshStandardMaterial({ color: '#2c2825', roughness: 0.95 });
-
-    /* ---- 握把：尾盖 + 缠带 ---- */
-    const grip = new THREE.Mesh(new THREE.CylinderGeometry(gripR, gripR * 0.96, gripLen, 24), gripMat);
-    grip.position.y = gripLen / 2;
-    grip.castShadow = true;
-    g.add(grip);
-
-    // 吸汗带缠绕：一叠细环。近看是纹理，远看只是一点点起伏，比纯圆柱诚实得多
-    const wrapGeo = new THREE.TorusGeometry(gripR + 0.0006, 0.0017, 6, 22);
-    for (let i = 0; i < 9; i++) {
-      const ring = new THREE.Mesh(wrapGeo, gripMat);
-      ring.rotation.x = Math.PI / 2;
-      ring.position.y = 0.045 + i * 0.018;
-      g.add(ring);
-    }
-
-    const butt = new THREE.Mesh(new THREE.CylinderGeometry(gripR * 1.14, gripR * 1.14, 0.014, 24), frameMat);
-    butt.position.y = 0.007;
-    butt.castShadow = true;
-    g.add(butt);
-
-    /* ---- 拍喉：两根分叉杆 + 中间的三角涂装 ---- */
-    for (const s of [-1, 1]) {
-      const dy = throatTop - gripLen;
-      const dx = s * throatHalfX;
-      const len = Math.hypot(dx, dy);
-      const strut = new THREE.Mesh(new THREE.CylinderGeometry(0.0115, 0.014, len, 14), frameMat);
-      strut.position.set(dx / 2, (gripLen + throatTop) / 2, 0);
-      // 圆柱默认沿 +Y，转到 (dx, dy) 方向
-      strut.rotation.z = -Math.atan2(dx, dy);
-      strut.castShadow = true;
-      g.add(strut);
-    }
-
-    const plate = new THREE.Shape();
-    plate.moveTo(-throatHalfX + 0.011, throatTop - 0.006);
-    plate.lineTo(throatHalfX - 0.011, throatTop - 0.006);
-    plate.quadraticCurveTo(0, gripLen + 0.062, -throatHalfX + 0.011, throatTop - 0.006);
-    const plateMesh = new THREE.Mesh(new THREE.ShapeGeometry(plate, 14), accentMat);
-    g.add(plateMesh);
-
-    /* ---- 拍框：椭圆管 ---- */
-    // 不能用 Torus + scale：那会把管子本身也压扁，椭圆长轴处框变细、短轴处变粗。
-    // 沿椭圆采样点再扫掠，管径才是均匀的。
-    const ringPts: THREE.Vector3[] = [];
-    const SEG = 72;
-    for (let i = 0; i < SEG; i++) {
-      const a = (i / SEG) * Math.PI * 2;
-      ringPts.push(new THREE.Vector3(Math.cos(a) * rx, headCY + Math.sin(a) * ry, 0));
-    }
-    const frame = new THREE.Mesh(
-      new THREE.TubeGeometry(new THREE.CatmullRomCurve3(ringPts, true), 144, frameR, 10, true),
-      frameMat
-    );
-    frame.castShadow = true;
-    g.add(frame);
-
-    /* ---- 拍线 14 × 16 ---- */
-    // 14×16 而不是真实的 16×19：再密一点在 1080p 下会糊成一片灰。
-    const pts: number[] = [];
-    const NV = 14;
-    const NH = 16;
-    const inRx = rx - frameR * 0.75;
-    const inRy = ry - frameR * 0.75;
-    for (let i = 1; i <= NV; i++) {
-      const x = (-1 + (2 * i) / (NV + 1)) * inRx;
-      const yy = inRy * Math.sqrt(Math.max(0, 1 - (x / inRx) ** 2));
-      pts.push(x, headCY - yy, 0, x, headCY + yy, 0);
-    }
-    for (let i = 1; i <= NH; i++) {
-      const y = (-1 + (2 * i) / (NH + 1)) * inRy;
-      const xx = inRx * Math.sqrt(Math.max(0, 1 - (y / inRy) ** 2));
-      pts.push(-xx, headCY + y, 0, xx, headCY + y, 0);
-    }
-    const gridGeo = new THREE.BufferGeometry();
-    gridGeo.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
-    g.add(
-      new THREE.LineSegments(
-        gridGeo,
-        new THREE.LineBasicMaterial({ color: '#8d9c93', transparent: true, opacity: 0.9 })
-      )
-    );
-
-    return g;
-  }
-
-  /**
-   * 拍面上那层 5% 白的薄膜。
-   *
-   * 只有拍线时，浅色背景一拍过去拍面就像个空环，读起来像羽毛球拍那种细框。
-   * 5% 的白几乎不影响透视，但眼睛会把它识别成一个完整的拍面。
-   * 直径收到拍框内沿以内（0.9 倍）：溢到框上会看起来像玻璃贴片而不是拍面。
-   */
-  private buildMembrane(): THREE.Mesh {
-    const membrane = new THREE.Mesh(
-      new THREE.CircleGeometry(1, 48),
-      new THREE.MeshBasicMaterial({
-        color: '#ffffff',
-        transparent: true,
-        opacity: 0.05,
-        side: THREE.DoubleSide,
-        depthWrite: false,
-      })
-    );
-    membrane.position.y = FACE_CY;
-    membrane.scale.set(FACE_RX * 0.9, FACE_RY * 0.9, 1);
-    return membrane;
-  }
-
-  /**
-   * 换上 `public/models/racket.glb` 里的球拍模型（1372 三角面，无贴图）。
-   *
-   * 模型自报的元数据和球拍组的约定完全一致——pivot 在柄底中心、拍头沿 +Y、
-   * 拍面法线 +Z、单位米，所以朝向一个都不用调，只差尺寸：
-   *
-   *   模型是真实比例（拍框外沿半宽 12.8cm，拍面中心在柄底上方 51.5cm），
-   *   而判定椭圆是 FACE_RX 15cm / FACE_RY 19cm、中心 FACE_CY 60cm。
-   *
-   * 直接摆进去，视觉拍面会比判定盘低 8.5cm：球从拍面下沿掠过时判「没打到」，
-   * 可看起来明明碰到了——这比尺寸差一点更伤人。所以两个轴分别拉：
-   *
-   *   - x 拉到拍框外沿正好等于 FACE_RX。这一条是**精确**对齐，不是凑数：
-   *     sweepFace 的判据是「球心在 FACE_RX + 球半径 的椭圆内」，也就是球体
-   *     贴着框外沿算命中——视觉框边正好落在 FACE_RX 上，两者严丝合缝。
-   *   - y 拉到拍面中心落在 FACE_CY（0.6/0.515 ≈ 1.165），顺带把柄长拉到 21.5cm。
-   *
-   * 非均匀缩放的代价是框管截面被压扁 0.6%（2.4cm 的管子差 1.5mm），肉眼不可能
-   * 看出来；换来的是「看到的拍面就是判定的拍面」。整体长度 68.5cm → 79.7cm，
-   * 和原来程序化那支（80.3cm）几乎一样，所以换拍之后场景观感不会跳。
-   */
-  private loadRacketModel() {
-    /** 模型 accessors 的包围盒：拍框外沿半宽、拍线区中心的 y */
-    const GLB_FRAME_HALF_X = 0.128;
-    const GLB_FACE_CY = 0.515;
-    const sx = FACE_RX / GLB_FRAME_HALF_X;
-    const sy = FACE_CY / GLB_FACE_CY;
-
-    new GLTFLoader().load(
-      `${import.meta.env.BASE_URL}models/racket.glb`,
-      (gltf) => {
-        // 石墨框 metallic 0.18 / roughness 0.34，在只有半球光+平行光的场景里会
-        // 糊成一块死黑（金属没有环境可反射就等于黑色）。给球拍单独一张环境贴图，
-        // 只赋给它的材质，不动 scene.environment——场地、球、墙的观感不该被换拍改掉。
-        const pmrem = new THREE.PMREMGenerator(this.renderer);
-        const env = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
-        pmrem.dispose();
-
-        const model = gltf.scene;
-        model.scale.set(sx, sy, 1);
-        model.traverse((o) => {
-          const mesh = o as THREE.Mesh;
-          if (!mesh.isMesh) return;
-          mesh.castShadow = true;
-          mesh.receiveShadow = true;
-          const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-          for (const m of mats) {
-            const mat = m as THREE.MeshStandardMaterial;
-            if ('envMap' in mat) {
-              mat.envMap = env;
-              mat.envMapIntensity = 0.6;
-              mat.needsUpdate = true;
-            }
-          }
-        });
-
-        const fallback = this.racket.getObjectByName('racket-fallback');
-        if (fallback) this.racket.remove(fallback);
-        this.racket.add(model);
-      },
-      undefined,
-      (err) => {
-        console.warn('[racket] glb 加载失败，继续用程序化球拍', err);
-      }
-    );
   }
 
   /* ---------------- 运行时 ---------------- */

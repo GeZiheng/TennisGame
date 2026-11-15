@@ -1,3 +1,5 @@
+import type { Q } from './quat';
+
 /**
  * 三维向量小工具。
  *
@@ -7,7 +9,18 @@
  */
 
 export type V3 = [number, number, number];
-export type Quat4 = [number, number, number, number];
+
+/**
+ * 四元数类型只是 `Q` 的别名，实现在 `core/quat.ts`。
+ *
+ * `Quat4` 这个名字是历史遗留（另一路叫 `Quat`，见 `imu.ts`），保留它是因为
+ * 拍面/枢轴这一路的 import 都写着 `Quat4`，改名不换来任何正确性。
+ */
+export type Quat4 = Q;
+
+// 四元数运算只有一份实现（`core/quat.ts`），这里再导出只是为了让
+// 「向量 + 旋转」的调用方可以只 import 一个文件。
+export { qconj, qslerp } from './quat';
 
 export const vsub = (a: V3, b: V3): V3 => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
 export const vmul = (a: V3, s: number): V3 => [a[0] * s, a[1] * s, a[2] * s];
@@ -38,47 +51,6 @@ export function vrot(q: Quat4, v: V3): V3 {
     v[1] + qw * ty + (qz * tx - qx * tz),
     v[2] + qw * tz + (qx * ty - qy * tx),
   ];
-}
-
-/** 四元数共轭 = 逆旋转（单位四元数前提下）。 */
-export const qconj = (q: Quat4): Quat4 => [-q[0], -q[1], -q[2], q[3]];
-
-/**
- * 球面线性插值。
- *
- * 拍面位姿是 60Hz 来的，物理是 240Hz 跑。要判断「球在第 3 个子步撞上拍面」，
- * 就必须知道拍面在那个**子步时刻**转过多少——直接拿上一帧的姿态会错开最多 16ms，
- * 快速挥拍时拍面已经转过 40° 以上，判定会整体偏一边。
- */
-export function qslerp(a: Quat4, b: Quat4, t: number): Quat4 {
-  let [bx, by, bz, bw] = b;
-  let cos = a[0] * bx + a[1] * by + a[2] * bz + a[3] * bw;
-
-  // q 与 -q 表示同一个旋转，夹角为负时翻转一侧走短弧，
-  // 否则会在半圈附近插出一条完全错误的路径。
-  if (cos < 0) {
-    cos = -cos;
-    bx = -bx;
-    by = -by;
-    bz = -bz;
-    bw = -bw;
-  }
-
-  // 足够接近就退化成线性插值再归一化，避免 sin 接近 0 时除爆
-  if (cos > 0.9995) {
-    const x = a[0] + (bx - a[0]) * t;
-    const y = a[1] + (by - a[1]) * t;
-    const z = a[2] + (bz - a[2]) * t;
-    const w = a[3] + (bw - a[3]) * t;
-    const l = Math.hypot(x, y, z, w) || 1;
-    return [x / l, y / l, z / l, w / l];
-  }
-
-  const theta = Math.acos(cos);
-  const s = Math.sin(theta);
-  const ka = Math.sin((1 - t) * theta) / s;
-  const kb = Math.sin(t * theta) / s;
-  return [a[0] * ka + bx * kb, a[1] * ka + by * kb, a[2] * ka + bz * kb, a[3] * ka + bw * kb];
 }
 
 export const clamp = (v: number, lo: number, hi: number): number => (v < lo ? lo : v > hi ? hi : v);

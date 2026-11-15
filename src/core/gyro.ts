@@ -20,7 +20,7 @@
  *      否则差分会在半圈附近突然反号，打出一记看不见的假挥拍。
  */
 
-import { qConj, qMul, type Quat } from './imu';
+import { qconj, qmul, type Quat } from './imu';
 import type { V3 } from './vec';
 
 /**
@@ -33,7 +33,7 @@ export function omegaFromQuatDelta(qPrev: Quat, qCur: Quat, dtSec: number): V3 {
   // dt 太小是被合并的重复事件，太大是页面切后台回来，两种都不该产出角速度
   if (!(dtSec > 1e-4) || dtSec > 0.5) return [0, 0, 0];
 
-  const d = qMul(qConj(qPrev), qCur);
+  const d = qmul(qconj(qPrev), qCur);
   let x = d[0];
   let y = d[1];
   let z = d[2];

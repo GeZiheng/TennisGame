@@ -10,30 +10,17 @@
  * P1 拿到真机数据、确认符号约定后，再补重力倾斜校正。
  */
 
-export type Quat = [number, number, number, number]; // x, y, z, w
+import { IDENTITY, qconj, qmul, qnorm, type Q } from './quat';
 
-export const IDENTITY: Quat = [0, 0, 0, 1];
-
-export function qMul(a: Quat, b: Quat): Quat {
-  const [ax, ay, az, aw] = a;
-  const [bx, by, bz, bw] = b;
-  return [
-    aw * bx + ax * bw + ay * bz - az * by,
-    aw * by - ax * bz + ay * bw + az * bx,
-    aw * bz + ax * by - ay * bx + az * bw,
-    aw * bw - ax * bx - ay * by - az * bz,
-  ];
-}
-
-export function qConj(q: Quat): Quat {
-  return [-q[0], -q[1], -q[2], q[3]];
-}
-
-export function qNormalize(q: Quat): Quat {
-  const n = Math.hypot(q[0], q[1], q[2], q[3]);
-  if (n < 1e-8) return [...IDENTITY];
-  return [q[0] / n, q[1] / n, q[2] / n, q[3] / n];
-}
+/**
+ * 四元数在这里只是别名，实现在 `core/quat.ts`。
+ *
+ * 历史上 `imu.ts` 和 `vec.ts` 各有一份四元数代数（`qMul/qConj/qNormalize`
+ * 与 `qconj/qslerp`），类型也分成 `Quat` / `Quat4` 两个同构元组。现在只剩
+ * 一份实现、一套命名；这里再导出是为了让「姿态这一路」的 import 路径不变。
+ */
+export type Quat = Q;
+export { IDENTITY, qconj, qmul, qnorm };
 
 /** 把角速度（rad/s，设备系）积分进姿态。 */
 function integrate(q: Quat, w: [number, number, number], dt: number): Quat {
@@ -46,7 +33,7 @@ function integrate(q: Quat, w: [number, number, number], dt: number): Quat {
     qw * wz + qx * wy - qy * wx,
     -qx * wx - qy * wy - qz * wz,
   ];
-  return qNormalize([qx + dq[0] * h, qy + dq[1] * h, qz + dq[2] * h, qw + dq[3] * h]);
+  return qnorm([qx + dq[0] * h, qy + dq[1] * h, qz + dq[2] * h, qw + dq[3] * h]);
 }
 
 export interface TrackerOptions {
@@ -119,7 +106,7 @@ export class ImuTracker {
 
   /** 相对中位姿态。玩家点「开始」那一刻的姿态被记为 0，之后所有输出都是相对它的增量。 */
   relativeTo(origin: Quat): Quat {
-    return qNormalize(qMul(qConj(origin), this.q));
+    return qnorm(qmul(qconj(origin), this.q));
   }
 
   snapshot(): Quat {

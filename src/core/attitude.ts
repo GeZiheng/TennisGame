@@ -19,7 +19,7 @@
  * 所以设备系 → 球拍本地系是单位矩阵，不需要任何额外映射。
  */
 
-import { qConj, qMul, qNormalize, type Quat } from './imu';
+import { qconj, qmul, qnorm, type Quat } from './imu';
 
 const D2R = Math.PI / 180;
 
@@ -39,8 +39,8 @@ export function deviceEulerToWorldQuat(alpha: number, beta: number, gamma: numbe
   const qz: Quat = [0, 0, Math.sin(a), Math.cos(a)];
   const qx: Quat = [Math.sin(b), 0, 0, Math.cos(b)];
   const qy: Quat = [0, Math.sin(g), 0, Math.cos(g)];
-  const earth = qMul(qMul(qz, qx), qy);
-  return qNormalize(qMul(EARTH_TO_WORLD, earth));
+  const earth = qmul(qmul(qz, qx), qy);
+  return qnorm(qmul(EARTH_TO_WORLD, earth));
 }
 
 /**
@@ -81,7 +81,7 @@ export function yawQuat(yaw: number): Quat {
  * 为什么不干脆全用相对姿态：那样手机横着拿、球拍却立着，看着就是「不一致」。
  */
 export function toOutputQuat(absolute: Quat, yawZero: number): Quat {
-  return qNormalize(qMul(yawQuat(-yawZero), absolute));
+  return qnorm(qmul(yawQuat(-yawZero), absolute));
 }
 
 /**
@@ -95,7 +95,7 @@ export function toOutputQuat(absolute: Quat, yawZero: number): Quat {
  * 积分（见 YawDriftObserver），近似误差不会进入结果。
  */
 function worldDeltaQuat(prev: Quat, next: Quat): Quat {
-  let dq = qMul(qNormalize(next), qConj(qNormalize(prev)));
+  let dq = qmul(qnorm(next), qconj(qnorm(prev)));
   // q 与 -q 是同一个旋转，固定到 w >= 0 的半球，避免读出长弧
   if (dq[3] < 0) dq = [-dq[0], -dq[1], -dq[2], -dq[3]];
   return dq;

@@ -6,14 +6,15 @@
 
 ## 8.1 一句话与运行链路
 
-`tests/` 目录下只有 **一个文件**：`tests/core.test.cjs`，**155 项**、26 个分组。它没有用 vitest / jest，而是自带一个 10 行的 `t(name, fn)`（`tests/core.test.cjs:14`）+ `node:assert`：每项单独 try/catch，失败打印 `FAIL` 并设 `process.exitCode`，**不中断**，最后打印「N 项通过」。
+`tests/` 目录下只有 **一个文件**：`tests/core.test.cjs`，**158 项**、26 个分组。它没有用 vitest / jest，而是自带一个 10 行的 `t(name, fn)`（`tests/core.test.cjs:14`）+ `node:assert`：每项单独 try/catch，失败打印 `FAIL` 并设 `process.exitCode`，**不中断**，最后打印「N 项通过」。
 
 理由写在 `scripts/test.mjs` 开头：`src/core/` 刻意不依赖 three.js 和 DOM，这几块逻辑（二进制协议、姿态积分、分位数、时钟同步）编成 CommonJS 就能在 Node 里直接跑，不必多装一套测试框架。
 
 ```bash
 npm test
 # └─ node scripts/test.mjs
-#    ├─ tsc 把 17 个 .ts 编到 .tmp-test/{core,play}/*.js（--module commonjs --target es2022）
+#    ├─ 调 scripts/core.mjs 的 buildCore({ outDir }) 把 18 个 .ts 编到 .tmp-test/core/*.js
+#    │  （--module commonjs --target es2022；清单只有 core.mjs 那一份）
 #    ├─ 写 .tmp-test/package.json = {"type":"commonjs"}（根项目是 ESM，产物必须单独声明）
 #    ├─ 把 tests/core.test.cjs 复制成 .tmp-test/run.cjs
 #    └─ 以 .tmp-test 为 cwd 执行 run.cjs
@@ -22,7 +23,7 @@ npm test
 因此有三件容易踩空的事：
 
 1. 测试里 `require('./core/xxx.js')` 指向的是**编译产物**，不是 `src/`。改完 TS 不重跑 `npm test`，测的还是旧代码。
-2. 编译输入有两份列表，**新增 core 模块必须两处都加**，否则 require 不到：`scripts/test.mjs`（编译到 `.tmp-test`）和 `scripts/core.mjs` 的 `CORE_FILES`（编译到 `.tmp-duel`，探针与 `duel-sim` 共用）。11-15 合并之后 `core.mjs` 是唯一一份 core 编译清单，`test.mjs` 那份多了 `play/stats`（只服务单测）——两边不再逐行相同，是刻意的。
+2. 编译输入**只有一份清单**：`scripts/core.mjs` 的 `CORE_FILES`。单测与探针的唯一区别是产物目录——`test.mjs` 调 `buildCore({ outDir: '.tmp-test' })`，探针与 `duel-sim` 用默认的 `.tmp-duel`。所以**新增 core 模块只要改 `CORE_FILES` 一处**；忘了加会立刻编译失败，而不是等运行时才发现某个模块加载不到。（11-15 之前这里是两份各写一份的 tsc 参数，`test.mjs` 还为此多编了一个 `play/stats`；`stats` 已迁入 `core/`，特例随之消失。）
 
 3. `test.mjs` 刻意不删 `.tmp-test/` 目录（删除拦截器会挡递归删除，tsc 会覆盖同名产物）。代价是目录里可能留旧文件：**别写成 `require('./court.js')` 漏掉 `/core/`**，那会静默加载过时物理，症状很像物理 bug。同理 `.tmp-duel/` 是 `npm run core` / `npm run duel-sim` 的产物，probe 脚本从那里读编译结果（`npm test` 只产出 `.tmp-test`，**不产出 `.tmp-duel`**）。
 
@@ -32,7 +33,7 @@ npm test
 
 | 层 | 入口 | 跑什么 | 能回答什么 | 覆盖不到的 |
 |---|---|---|---|---|
-| 单测 | `npm test` | 155 项，算子级 + 短场景 | 某个公式、判据、状态机分支对不对 | 整局手感、网络、真机 |
+| 单测 | `npm test` | 158 项，算子级 + 短场景 | 某个公式、判据、状态机分支对不对 | 整局手感、网络、真机 |
 | 对打模拟 | `npm run duel-sim` | 三档难度 × 6 种子 × 60s，玩家侧是求解器（含发球） | 回球机能不能连续接球、**能不能接得住发球**、难度梯度方向对不对 | 玩家侧不是 `shotFromStroke`，见 `docs/duel.md` 第 8 节 |
 | 调参取证 | `scripts/probe-*.cjs` | 扫拍面高度 / 落点 / 转角 / 站位 | 「为什么这个数是这个值」的实测依据 | 不自动判定通过/失败，要人读表 |
 | 信令冒烟 | `npm run test:signal` | 两个 WebSocket 客户端走配对→转发→断线 | 房间配对链路通不通 | 需先 `npm run dev`，**不在 `npm test` 里** |
@@ -51,8 +52,8 @@ npm test
 | 姿态换算 | 8 | `core/attitude.ts` | 设备系 → 世界系：直立/平放/后仰/侧转四种姿态、朝向归零后 yaw 为 0 但倾斜保留、alpha 变化只改朝向、`qAngle` 把 q 与 −q 视为同一旋转、能识别 90° 姿态瞬跳。`EARTH_TO_WORLD` 方向整体反了，这组会立刻指出来 |
 | 偏航慢漂观测 | 8 | `core/attitude.ts` | `worldYawDelta` 还原纯 yaw 增量且 q / −q 同解、纯俯仰不计入、**竖直持握时 gamma 混进世界 Y 转角**（反手位依赖的数学根因）、万向锁分支识别、慢漂积分 / 挥拍大转角放过 / 换握跳变放过、**扣掉观测漂移后输出回到启动姿态**、`reset()` 归零。最后一条是「不重定义正前方」的直接反证 |
 | 姿态连续性门 | 8 | `core/attitude.ts` | `PoseContinuityGate`：真实快挥拍越过角度门限仍须采信、静止大跳变仍拦、**跳变只拦一帧（基准不能冻结）**、外推超时强制重锚、25Hz + 35rad/s 全程零外推、`reset()` 归零；外加漂移观测的**非 Y 轴纯度判据**（俯仰不算漂移、纯 yaw 慢漂不误伤）。前五条是「快挥拍打不到 + 拍子疯狂抖」的直接反证 |
-| 统计 | 4 | `play/stats.ts` | 分位数取整不越界、样本极少不崩、滑动窗口只留最近 240 个、乱序下的丢包率 |
-| 时钟同步 | 4 | `play/stats.ts` | 已知偏移下单向延迟还原、只采纳更优 RTT 样本、**对端页面重载导致时钟基准突变时必须重新锚定**、`reset()` 后必须重新收敛。前一条是重连后每球漏接的直接反证；**偏移符号写反不会报错**，只会让延迟变成负数或大得离谱，看起来像网络问题 |
+| 统计 | 4 | `core/stats.ts` | 分位数取整不越界、样本极少不崩、滑动窗口只留最近 240 个、乱序下的丢包率 |
+| 时钟同步 | 4 | `core/stats.ts` | 已知偏移下单向延迟还原、只采纳更优 RTT 样本、**对端页面重载导致时钟基准突变时必须重新锚定**、`reset()` 后必须重新收敛。前一条是重连后每球漏接的直接反证；**偏移符号写反不会报错**，只会让延迟变成负数或大得离谱，看起来像网络问题 |
 | 角速度兜底 | 4 | `core/gyro.ts` | 由姿态差分反推 ω：30°/16.7ms → ≈31.4 rad/s、带基准姿态后增量仍在设备系、`q` 与 `−q` 是同一姿态故差分为 0、dt 不合理时不产出角速度 |
 | 挥拍检测 | 13 | `core/swing.ts` | 静止晃动不触发、一次挥拍只出一个峰、260ms 冷却、峰值后 1–2 帧结算、平台段（同一值重复上报）仍能及时结算且拿到真实峰值、**抢跑 `liveStroke`**（球到面那一帧取「正在挥」的快照、窗口外不给、消费后回落不重复结算、下一拍仍可识别）、拍头速度 = `ω × r` 且垂直于握把、匀速转动走超时兜底、球速被夹在可打区间 |
 | 出球模型 | 6 | `core/swing.ts` + `racket.ts` | `shotFromStroke`：拍面正对朝 −Z、**拍框正对来球（侧着 90°）判「没打开」**、向上刷/向下切 → 上旋/下旋、横向挥拍 → 侧旋并往挥拍侧偏；**反手（法线朝后）与正手出球逐位相同**（含旋转，11-15「反手接不到球」的反证）；`frontFace` 只翻明确朝后的、屏幕朝天/侧向不翻、幂等 |
@@ -115,7 +116,7 @@ npm test
 - `ImuTracker.update(gyro, dtMs)`、`SwingDetector` 的 `feed(..., dt=16)` 也是毫秒。
 - `physics.advance(ball, dt, onStep)` 的 `dt` 是**秒**，定步长 1/240。
 
-**加模块**：见 8.1 第 2 条，两处编译输入都要加。`onStep` 回调返回 `false` 表示事件已处理，必须 `break`，否则会重复结算。
+**加模块**：见 8.1 第 2 条，只在 `scripts/core.mjs` 的 `CORE_FILES` 里加一处。`onStep` 回调返回 `false` 表示事件已处理，必须 `break`，否则会重复结算。
 
 **场景要像真机，别过度理想化**（详见 `docs/tuning.md` 6.3）：
 
@@ -148,8 +149,14 @@ npm test
 
 ```bash
 npm run dev:https          # 手机扫码接入
-# 大屏上：L 开始/暂停采集 · K 导出 .jsonl（同时把分组读数打到控制台）· R 换段
+# 大屏上：默认已开采（HUD 左上角「采集 s1 · 37 条」）
+#   L 暂停/恢复（暂停时先落盘）· K 立刻落盘 + 控制台打分组读数 · R 换段
 ```
+
+**数据直接写进 `data/contact/`，不用手工导出**：走 dev server 的 `POST /__contact`，
+攒 8 条、停手 10 秒、关页 `sendBeacon` 三处兜底。文件名是页面打开时刻
+（`20261115-161230.jsonl`），刷新一次就是新文件，两次会话不会混。服务端不可用时
+（比如直接开 `dist/`）`K` 会退回浏览器下载。目录说明见 `data/contact/README.md`。
 
 **三种相遇都会记，别按成败过滤**：
 
@@ -162,15 +169,37 @@ npm run dev:https          # 手机扫码接入
 只留命中的样本会引入**截断偏置**：保留 `|delta| < 判定半轴` 的那部分，估出来的均值必然偏小，
 正好把要修的那个偏差抹掉。所以 `hit: false` 的一条都不能丢。
 
+**发球不采、也不进训练集**，这是定下来的规则（抛球位置 4.25 已定稿，不需要校准；举在
+头上打的杆向量分布和地面击球不同）。发球走 `tickToss` 的独立判定，不产生 `contact`
+事件，所以 `meta.serve` 恒为 false；`usableForCalibration()` 仍按它剔除，是留给「以后
+有人把发球接进统一采集」的护栏。两条测试钉着这一层，改采集路径时先看它们。
+
 **一行一条 JSON，三块不能混**：`label`（含 `G` 握点，只用来算 delta，**禁止进特征**）、
-`feat`（与走位无关的外部条件，模型能吃的 X）、`meta`（命中标志、第几拍、漂移读数）。
-把 `G` 当特征喂进模型就是闭环自激，它会开始拟合自己的输出。
+`feat`（与走位无关的外部条件，模型能吃的 X）、`meta`（命中标志、第几拍、漂移读数、
+瞄准点与走位容差）。把 `G` 当特征喂进模型就是闭环自激，它会开始拟合自己的输出。
+
+**`meta` 里那三个走位量是诊断用的，不是特征**：
+
+| 字段 | 含义 | 拿它算什么 |
+|---|---|---|
+| `planOffset` | 相遇**前**喂给 `planAutoMove` 的瞄准点 | 残差 = `delta − (planOffset − rest)` |
+| `holdR` | 当时生效的 `TargetHold.holdR` | 残差里「按设计允许不动」的那一截 |
+| `deadband` | 当时生效的 `stepAxis` 死区（x / z） | 同上 |
+| `deadbandY` | 竖直轴死区，比 `deadband` 小 | 同上。分轴：拿 0.05 减 y 会减多 |
+
+`aimResidual()` 就是那个残差，而且它**正好等于 `fc − p`**（拍面中心偏离瞄准点）。
+走位把握点放在 `G = p − planOffset`，相遇时 `fc = G + rest + delta`，两边一减
+`fc − p = delta − (planOffset − rest)`。所以残差可以直接和判定半轴（横 0.20 / 竖 0.24）
+对比，不用换算；`meta.offCenter` 那条距离做不到这一点——它混进了挥拍的那一份，拆不开。
+
+判断「走位本身准不准」要**先减掉 0.14 + 0.05**：站位停在 `holdR` 以内、小于 `deadband`
+的偏差是按设计不动，不是走位错。混在一起算会得出「走位一直偏 19cm」的错误结论。
 
 **采完先看第一层漏斗，别急着建模**：`lagBuckets()` 按挥拍时差分三桶。
 三桶的 `delta` 均值几乎一样 ⇒ `lag` 不是主因，校准器的收益上限很低，回头查别的原因；
 差得明显才值得往下走（线性回归）。200 球就能证伪或证实整条路线。
 
-**两条采集侧的坑**（都已在代码里处理，改的时候别破坏）：
+**三条采集侧的坑**（都已在代码里处理，改的时候别破坏）：
 
 1. **`fc` 必须用接触时刻的姿态**（`RacketTrack.at(contactAt)`），不能用渲染帧的 `lastPose`。
    挥拍 30 rad/s 时一帧（16.7ms）差 28°，杆端差 30cm——和判定半轴同量级，而且单边偏晚、
@@ -178,3 +207,7 @@ npm run dev:https          # 手机扫码接入
 2. **漏接的「最近点」要在子步里找**（`checkReceiverFace`），不能每帧算一次。球速 20m/s
    时一帧走 0.33m，帧粒度量出来的最近距离误差比信号还大。只留 0.6m 以内的（约 3 个判定
    半轴），更远的不是「瞄偏了」而是「没挥到球附近」，采进来会把均值往零拉。
+3. **`planOffset` 必须是相遇前的快照**。命中之后 `learnContact` 会原地把它朝这一拍的
+   `delta` 收敛，取晚一拍记到的就是「学完之后」的瞄准点，残差凭空变小——正好把要诊断的
+   偏差自己抹掉。`buildContactSample` 里存的是拷贝，一条测试钉着它（改回存引用，所有
+   样本都会显示最后一帧的瞄准点，而文件看起来完全正常）。

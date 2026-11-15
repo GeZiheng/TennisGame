@@ -1,10 +1,10 @@
 const assert = require('node:assert');
 const { encodePacket, decodePacket, PACKET_BYTES } = require('./core/protocol.js');
-const { ImuTracker, qConj, qMul, qNormalize } = require('./core/imu.js');
+const { ImuTracker, qconj, qmul, qnorm } = require('./core/imu.js');
 const { deviceEulerToWorldQuat, qYaw, toOutputQuat, qAngle,
   worldYawDelta, isYawGimbal, YawDriftObserver,
   PoseContinuityGate, MAX_POSE_JUMP, MAX_EXTRAP_MS } = require('./core/attitude.js');
-const { LatencyWindow, ClockSync, PacketStats } = require('./play/stats.js');
+const { LatencyWindow, ClockSync, PacketStats } = require('./core/stats.js');
 const { SwingDetector, shotFromStroke } = require('./core/swing.js');
 const { omegaFromQuatDelta } = require('./core/gyro.js');
 const { makeBall, advance, aimIntoCourt, predictAtPlane, sampleCrossings } = require('./core/physics.js');
@@ -18,7 +18,7 @@ const { serveBox, serveStandX, inServeBox, serveAim, serveStrike, tossContact, O
 const { BALL_R, HIT_Z, RACKET_POS, FACE_RX, FACE_RY, FACE_CY, NET_Z, NET_H, HALF_WIDTH, PHYS_DT, OPP_HIT_Z, OPP_BASELINE_Z, BASELINE_Z, GRAVITY } = require('./core/court.js');
 const { sweepFace, faceCovers, faceCenter, frontFace, RacketTrack, IDLE_POSE } = require('./core/racket.js');
 const { buildContactSample, lagBuckets, samplesToJsonl, summarizeContacts, usableForCalibration,
-  ContactLog } = require('./core/contact-log.js');
+  aimResidual, ContactLog } = require('./core/contact-log.js');
 
 let pass = 0;
 const t = (name, fn) => {
@@ -124,8 +124,8 @@ t('相对姿态：中位自身返回单位四元数', () => {
 });
 
 t('四元数乘法/共轭自洽 q ⊗ q* = 1', () => {
-  const q = qNormalize([0.3, -0.4, 0.5, 0.7]);
-  const r = qMul(q, qConj(q));
+  const q = qnorm([0.3, -0.4, 0.5, 0.7]);
+  const r = qmul(q, qconj(q));
   assert.ok(Math.abs(r[0]) < 1e-9 && Math.abs(r[1]) < 1e-9 && Math.abs(r[2]) < 1e-9);
   assert.ok(Math.abs(Math.abs(r[3]) - 1) < 1e-9);
 });
@@ -522,7 +522,7 @@ t('绕设备 x 轴 30°/16.7ms → ω ≈ 31.4 rad/s', () => {
 t('带上基准姿态后，增量仍然落在设备系', () => {
   // 先随便转一个姿态，再绕自身 x 轴追加 20°：算出来的 ω 必须还是纯 x
   const base = qAA([0, 1, 0], 70);
-  const cur = qMul(base, qAA([1, 0, 0], 20));
+  const cur = qmul(base, qAA([1, 0, 0], 20));
   const w = omegaFromQuatDelta(base, cur, 0.02);
   assert.ok(Math.abs(w[0] - (Math.PI / 9) / 0.02) < 0.05, `wx=${w[0].toFixed(3)}`);
   assert.ok(Math.abs(w[1]) < 1e-6 && Math.abs(w[2]) < 1e-6, '不该漏到别的轴上');
@@ -2076,6 +2076,7 @@ t('delta = (fc − 握点) − restOffset，模长不超过一根拍柄的两倍
     t: 100,
     grip: [0, 1.3, 0.3],
     rest: [0, 0.6, 0],
+    planOffset: [0, 0.6, 0], holdR: 0.14, deadband: 0.05, deadbandY: 0.02,
     capture: { t: 100, fc: [0.1, 1.9, 0.4], at: [0.1, 1.9, 0.4], ballV: [0, 0, 10],
       hit: true, offCenter: 0.1, lag: 12, stroke: { peakW: 20, speed: 22, charge: 0.5, face: [0, 0, -1] }, serve: false },
     rally: 2, sincePrevHit: 1200, driftDeg: null, session: 's1',
@@ -2092,6 +2093,7 @@ t('样本里的坐标是拷贝：改源数组不会改到已记的样本', () =>
   const rest = [0, 0.6, 0];
   const s = buildContactSample({
     t: 1, grip, rest,
+    planOffset: [0, 0.6, 0], holdR: 0.14, deadband: 0.05, deadbandY: 0.02,
     capture: { t: 1, fc: [0, 1.9, 0.3], at: [0, 1.9, 0.3], ballV: [0, 0, 10],
       hit: true, offCenter: 0, lag: null, stroke: null, serve: false },
     rally: 1, sincePrevHit: null, driftDeg: null, session: 's1',
@@ -2105,6 +2107,7 @@ t('样本里的坐标是拷贝：改源数组不会改到已记的样本', () =>
 
 const mkSample = (lag, dx, opts = {}) => buildContactSample({
   t: 0, grip: [0, 1.3, 0.3], rest: [0, 0.6, 0],
+  planOffset: opts.planOffset || [0, 0.6, 0], holdR: opts.holdR ?? 0.14, deadband: opts.deadband ?? 0.05, deadbandY: 0.02,
   capture: { t: 0, fc: [dx, 1.9, 0.3], at: [dx, 1.9, 0.3], ballV: [0, 0, 10],
     hit: opts.hit !== false, offCenter: 0.1, lag, stroke: null, serve: opts.serve === true },
   rally: 1, sincePrevHit: null, driftDeg: null, session: 's1',
@@ -2130,6 +2133,55 @@ t('lag 分桶：三桶、lag 为 null 的不进桶、发球不进桶', () => {
   assert.ok(Math.abs(b[2].mean[0] - 0.6) < 1e-9);
 });
 
+t('样本记下相遇前的瞄准点与走位容差，且必须是快照', () => {
+  // 这三项是为了「事后还原当时瞄的是哪、允许多少静差」，不是特征
+  const aim = [0.02, 0.61, -0.13];
+  const s = buildContactSample({
+    t: 0, grip: [0, 1.3, 0.3], rest: [0, 0.6, 0],
+    planOffset: aim, holdR: 0.14, deadband: 0.05, deadbandY: 0.02,
+    capture: { t: 0, fc: [0.1, 1.9, 0.3], at: [0.1, 1.9, 0.3], ballV: [0, 0, 10],
+      hit: true, offCenter: 0.2, lag: 10, stroke: null, serve: false },
+    rally: 1, sincePrevHit: null, driftDeg: null, session: 's1',
+  });
+  assert.deepStrictEqual(s.meta.planOffset, [0.02, 0.61, -0.13]);
+  assert.strictEqual(s.meta.holdR, 0.14);
+  assert.strictEqual(s.meta.deadband, 0.05);
+  assert.strictEqual(s.meta.deadbandY, 0.02, '竖直轴死区更小，不能只记一个 deadband');
+
+  // `planOffset` 在 app 里是每帧原地改的模块级数组。存引用的话，导出时所有样本
+  // 都会显示「最后一帧」的瞄准点，而文件看起来完全正常——这是最难查的那种错。
+  aim[0] = 9;
+  assert.strictEqual(s.meta.planOffset[0], 0.02, 'planOffset 必须存快照，不能留引用');
+
+  // 它和 `G` 是同一个东西的两种形式，进了特征就是闭环自激
+  assert.ok(!('planOffset' in s.feat) && !('holdR' in s.feat) && !('deadband' in s.feat),
+    '走位容差与瞄准点只能进 meta');
+});
+
+t('瞄准残差 = 拍面中心偏离瞄准点，且正好等于 fc − p', () => {
+  // G = p − planOffset，所以 p = G + planOffset；残差应当逐分量等于 fc − p
+  const G = [0, 1.3, 0.3];
+  const planOffset = [0, 0.6, 0.02];
+  const p = [G[0] + planOffset[0], G[1] + planOffset[1], G[2] + planOffset[2]];
+  const fc = [0.1, 1.9, 0.4];
+  const s = buildContactSample({
+    t: 0, grip: G, rest: [0, 0.6, 0], planOffset, holdR: 0.14, deadband: 0.05, deadbandY: 0.02,
+    capture: { t: 0, fc, at: p, ballV: [0, 0, 10], hit: true, offCenter: 0.2,
+      lag: 0, stroke: null, serve: false },
+    rally: 1, sincePrevHit: null, driftDeg: null, session: 's1',
+  });
+  const r = aimResidual(s);
+  // 残差是三次减法叠出来的，不能按位比（0.6 − 0.6 会留 1e-16）
+  for (let i = 0; i < 3; i++) {
+    assert.ok(Math.abs(r[i] - (fc[i] - p[i])) < 1e-9, `第 ${i} 轴：残差应等于 fc − p`);
+  }
+  assert.ok(Math.abs(r[0] - 0.1) < 1e-9 && Math.abs(r[1]) < 1e-9 && Math.abs(r[2] - 0.08) < 1e-9);
+
+  // 旧样本（11-15 之前）没有 planOffset，不能算出残差，返回 null 而不是 0
+  delete s.meta.planOffset;
+  assert.strictEqual(aimResidual(s), null, '缺字段要显式返回 null，不能编一个 0 出来');
+});
+
 t('JSONL：一行一条、分组齐全、空集合给空串', () => {
   assert.strictEqual(samplesToJsonl([]), '');
   const text = samplesToJsonl([mkSample(10, 0.1), mkSample(20, 0.3)]);
@@ -2140,6 +2192,8 @@ t('JSONL：一行一条、分组齐全、空集合给空串', () => {
   assert.ok('G' in row.label && 'delta' in row.label);
   assert.ok('lag' in row.feat && 'rest' in row.feat);
   assert.strictEqual(row.label.rest[1], 0.6, 'label 和 feat 的 rest 应是同一份快照');
+  assert.ok('planOffset' in row.meta && 'holdR' in row.meta && 'deadband' in row.meta
+    && 'deadbandY' in row.meta, 'meta 应带上瞄准点与走位容差');
 });
 
 t('分组读数把「命中」和「没碰到」分开列', () => {
@@ -2160,6 +2214,48 @@ t('采集未开启时 push 静默丢弃，开了才攒', () => {
   log.push(mkSample(10, 0.1));
   assert.strictEqual(log.count, 1);
   assert.strictEqual(log.toJsonl().trim().split('\n').length, 1);
+});
+
+/**
+ * 发球不进采集，是一条**定下来的规则**（抛球位置 4.25 已定稿，不需要校准），
+ * 不是「恰好没采到」。它现在由 `checkReceiverFace` 的 `phase !== 'live'` 挡住，
+ * 而那条判断很容易在重构里被顺手改掉，所以在这里钉住。
+ */
+t('发球：抛球阶段挥拍能打出去，但一条 contact 样本都不产生', () => {
+  const d = new Duel();
+  d.phase = 'toss';
+  d.hitter = 'player';
+  d.receiver = 'machine';
+  d.serveServer = 'player';
+  d.serveCourt = 'deuce';
+  d.servePending = true;
+
+  const g = IDLE_POSE.pos;
+  // 抛球落在握点前上方，正好穿过 `tossContact` 的击球区
+  d.ball = makeBall([g[0], g[1] + 1.2, g[2] - 0.25], [0, -1, 0]);
+
+  let now = 0;
+  const out = [];
+  let swung = false;
+  for (let i = 0; i < 240; i++) {
+    now += 1000 / 60;
+    d.pushRacket({ t: now, pos: [...g], q: [...IDLE_POSE.q] });
+    // 球落到击球区附近时挥一拍
+    if (!swung && d.ball.p[1] < g[1] + 0.75) {
+      swung = true;
+      d.submit({
+        t: now, peakW: 18, head: [0, 0, 20], speed: 20,
+        face: [0, 0, -1], grip: [0, 1, 0], charge: 0.6, used: false,
+      });
+    }
+    for (const e of d.update(1 / 60, now)) out.push(e);
+    if (out.some((e) => e.kind === 'hit' && e.serve)) break;
+  }
+
+  assert.ok(out.some((e) => e.kind === 'hit' && e.serve), '这一发应该真的打出去了，否则测不到东西');
+  assert.strictEqual(out.filter((e) => e.kind === 'contact').length, 0,
+    '发球是另一条路径：不许往校准器的训练集里塞样本');
+  assert.ok(swung, '挥拍要在球落地前发生');
 });
 
 console.log(`\n${pass} 项通过`);

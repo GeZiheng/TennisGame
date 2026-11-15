@@ -66,7 +66,7 @@ npm run dev          # HTTP，5183，不需要证书
 | `npm run dev:https` | 真机主命令（HTTPS + 5184 + 自动签证书） |
 | `npm run dev` | 纯本地看画面（HTTP + 5183） |
 | `npm run build` | 类型检查 + 打包 |
-| `npm test` | 核心逻辑单测（155 项，不需要浏览器） |
+| `npm test` | 核心逻辑单测（158 项，不需要浏览器） |
 | `npm run core` | 只把 `src/core` 编译到 `.tmp-duel`（诊断脚本都用它，独立跑一次即可） |
 | `npm run duel-sim` | 对打模拟：3 档 × 6 种子，验回球机能不能连续接球、能不能接住发球 |
 | `npm run verify` | 全套验证：单测 ×3 → duel-sim → build，任一步失败即退出（提交前的快检由 git hook 自动跑） |
@@ -444,7 +444,7 @@ README 只留操作和手感。下面这些是开发者向的来龙去脉，按�
 ## 测试
 
 ```bash
-npm test         # 155 项：核心逻辑单测，不需要浏览器（分组明细见 docs/testing.md）
+npm test         # 158 项：核心逻辑单测，不需要浏览器（分组明细见 docs/testing.md）
 npm run core     # 编译 src/core → .tmp-duel（probe 脚本读这份）
 npm run duel-sim # 对打模拟，3 档 × 6 种子 × 60s，带回球机门禁断言
 npm run verify   # 全套验证：test ×3 → duel-sim → build；提交前 hook 自动跑快检
@@ -470,7 +470,7 @@ src/
   controller/  手机：传感器采集、环境自检、60Hz 发包
 server/        信令房间 + Vite 插件（证书、局域网 IP）
 scripts/       证书、单测跑手、端到端模拟、verify、probe-* 诊断、git hook
-tests/         core.test.cjs（155 项）
+tests/         core.test.cjs（158 项）
 docs/          algorithms / duel / history / tuning / known-issues / testing / motion-accuracy
 AGENTS.md      交接入口：当前状态、取证决策树、文档地图
 ```
