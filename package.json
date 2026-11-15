@@ -5,16 +5,14 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host",
-    "dev:duel": "vite --host -c vite.config.duel.ts",
     "dev:https": "node scripts/make-cert.mjs && vite --host -c vite.config.https.ts",
-    "dev:duel:https": "node scripts/make-cert.mjs && vite --host -c vite.config.duel.https.ts",
     "cert": "node scripts/make-cert.mjs",
     "trust": "node scripts/trust-ca.mjs",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview --host",
     "test": "node scripts/test.mjs",
     "test:signal": "node scripts/signal-smoke.mjs",
-    "sim": "node scripts/sim.mjs",
+    "core": "node scripts/core.mjs",
     "duel-sim": "node scripts/duel-sim.mjs",
     "verify": "node scripts/verify.mjs",
     "prepare": "node scripts/install-hooks.mjs"

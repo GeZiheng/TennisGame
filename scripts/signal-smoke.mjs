@@ -6,7 +6,7 @@
  */
 import { WebSocket } from 'ws';
 
-const BASE = process.env.SIGNAL_URL ?? 'ws://127.0.0.1:5173/signal';
+const BASE = process.env.SIGNAL_URL ?? 'ws://127.0.0.1:5183/signal';
 const ROOM = 'TST1';
 
 const seen = { host: [], peer: [] };

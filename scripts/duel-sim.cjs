@@ -11,6 +11,8 @@ const { Duel } = require('../.tmp-duel/core/duel.js');
 const { predictAtPlane, MACHINE_L1, MACHINE_L2, MACHINE_L3 } = require('../.tmp-duel/core/machine.js');
 const { HIT_Z, OPP_HIT_Z, NET_Z, OPP_BASELINE_Z, BASELINE_Z, HALF_WIDTH, BALL_R, RACKET_POS } = require('../.tmp-duel/core/court.js');
 const { aimIntoCourt } = require('../.tmp-duel/core/physics.js');
+const { serveBox, serveStrike, SERVE_STAND_Z } = require('../.tmp-duel/core/serve.js');
+const { AUTO_MOVE_DEFAULTS } = require('../.tmp-duel/core/auto-move.js');
 
 const argv = process.argv.slice(2);
 const argOf = (k, d) => {
@@ -52,7 +54,7 @@ function qrot(q, v) {
   ];
 }
 
-/** 拍柄朝上、拍面朝 -z 的基准姿态（和 sim-e2e 同一个构造） */
+/** 拍柄朝上、拍面朝 -z 的基准姿态（和探针 `lib/probe-player.cjs` 同一个构造） */
 function racketQuat(thetaDeg) {
   const half = (thetaDeg * Math.PI) / 360;
   return [0, Math.cos(half), Math.sin(half), 0];
@@ -65,7 +67,38 @@ const FACE_OFF = qrot(Q, [0, 0.6, 0]);
 const FACE_DIR = qrot(Q, [0, 0, 1]);
 
 const SWING_LEAD = 0.075;
-const MOVE = 4.2;
+/**
+ * 横向跑动速度。直接取 `AUTO_MOVE_DEFAULTS.speed`：脚本玩家不能拥有真机没有的
+ * 跑动能力，也不能比真机慢——两边一旦漂了，门禁量到的就不是玩家身上的行为。
+ */
+const MOVE = AUTO_MOVE_DEFAULTS.speed;
+
+/**
+ * 发球站位上握点举多高。
+ *
+ * 真机那边 `app.ts` 搬的是 `RACKET_POS[1] + 0.32`（`Duel.playerAtStance` 要求
+ * 高过 `+0.25`），这里用同一个数，否则脚本玩家永远站不到位、每分都等到
+ * `SETUP_MAX_MS` 超时才抛球。
+ */
+const SERVE_GRIP_Y = RACKET_POS[1] + 0.32;
+
+/**
+ * 发球拍面：从 `contact` 指向地面上的 `(tx, tz)`。
+ *
+ * `serveAim` 只读拍面的**水平偏角**（决定左右）和**俯角**（映射成区内的深浅），
+ * 所以这里不用去解弹道——挑一个中段的俯角（3°–18° 行程的中间 ≈ 10.5°），
+ * 再让偏角指向目标点就够了。落点最终由 `Duel.launchServe` 的求解器保证。
+ */
+function serveFace(contact, tx, tz) {
+  const pitch = (10.5 * Math.PI) / 180;
+  // atan2(dx, dz 的相反数)：目标总在 -z 方向，所以 `contact[2] - tz > 0`
+  const yaw = Math.atan2(tx - contact[0], contact[2] - tz);
+  return [
+    Math.cos(pitch) * Math.sin(yaw),
+    -Math.sin(pitch),
+    -Math.cos(pitch) * Math.cos(yaw),
+  ];
+}
 
 function makeRng(seed) {
   let s = seed >>> 0;
@@ -88,14 +121,19 @@ function run(level, cfg, seed, seconds) {
   const frames = Math.round((seconds * 1000) / dt);
 
   let gripX = 0;
-  // 测试玩家的握点上限就是真机的握点高度（`RACKET_POS[1]`）；下限 0.38m 是「屈膝」的量。
-  const GRIP_TOP = RACKET_POS[1];
-  const GRIP_LOW = GRIP_TOP - 0.38;
-  let gripY = GRIP_TOP;
+  // 握点行程直接取 `AUTO_MOVE_DEFAULTS`：真机的自动走位就是按这一对上下限搬握点的
+  // （`minGripY`=0.70 深屈膝 / `maxGripY`=1.65 举拍）。这里曾经硬写成
+  // `RACKET_POS[1]` 和 `RACKET_POS[1]-0.38`，那是 11-13 之前的旧模型——照着它量，
+  // 「接不到球」会被误判成回球机的问题，实际是测试玩家比真机矮了一截。
+  const GRIP_TOP = AUTO_MOVE_DEFAULTS.maxGripY;
+  const GRIP_LOW = AUTO_MOVE_DEFAULTS.minGripY;
+  let gripY = RACKET_POS[1];
   let lastSubmit = -1e9;
   let lastAim = null;
   let clampedLow = 0;
   let clampedHigh = 0;
+  /** 玩家刚发出一个球、还没被接到（用来数「接发球成功率」） */
+  let awaitReturn = false;
 
   const stat = {
     playerPoints: 0,
@@ -108,22 +146,42 @@ function run(level, cfg, seed, seconds) {
     serves: 0,
     aimNull: 0,
     swingsMade: 0,
+    /** 脚本玩家真正挥出去的发球数（抛球落下 → 挥到） */
+    playerServes: 0,
+    /** 玩家发球失误：一发 / 二发分开数，二发失误就是双误 */
+    playerFault1: 0,
+    playerFault2: 0,
+    /** 玩家的发球被回球机接回来的次数（与 `playerServes` 相除就是接发球成功率） */
+    machineServeReturns: 0,
   };
 
   try {
     for (let i = 0; i < frames; i++) {
       const now = now0 + i * dt;
 
-      // ---- 玩家：预测到面点 → 摆拍 → 到点就挥 ----
+      // ---- 玩家：发球局站发球位，其余时间「预测到面点 → 摆拍 → 到点就挥」 ----
+      //
+      // `playerServeStanceX` 非 null 就说明这一刻轮到玩家发球（包含分与分之间的
+      // `wait`），站位由发球区决定。**它优先于自动走位**，和真机 `app.ts` 一致：
+      // 发球是站位固定的动作，一边跑一边发不是网球。
+      const stanceX = duel.playerServeStanceX;
+      const serving = stanceX !== null;
+
       let pred = null;
-      if (duel.receiver === 'player' && duel.ball.v[2] > 0.5 && duel.phase === 'live') {
+      if (!serving && duel.receiver === 'player' && duel.ball.v[2] > 0.5 && duel.phase === 'live') {
         pred = predictAtPlane(duel.ball, HIT_Z);
       }
 
-      if (pred) {
+      if (serving) {
+        gripX = stanceX;
+        gripY = SERVE_GRIP_Y;
+      } else if (pred) {
         // 横向走位（限速），纵向靠抬高/压低握点模拟屈膝
         const step = (MOVE * dt) / 1000;
         gripX += Math.max(-step, Math.min(step, pred.x - gripX));
+        // 站位边界和真机同一组常量：11-15 起横向放到边线外 1.5m、纵向到网前 4m，
+        // 脚本也得按这个夹——否则它会「跑到」真机根本去不了的位置。
+        gripX = Math.max(-AUTO_MOVE_DEFAULTS.maxX, Math.min(AUTO_MOVE_DEFAULTS.maxX, gripX));
         // 真实玩家的握点上限恒是 RACKET_POS[1]，拍面中心只能在半径 0.6 的球壳上。
         // 这里按同一段夹住，别让测试玩家拥有真机没有的「蹲下去」能力——否则测出来
         // 的命中率是假的。上下限都由 `RACKET_POS[1]` 推，握点一改这里跟着改。
@@ -135,13 +193,45 @@ function run(level, cfg, seed, seconds) {
 
       const pose = {
         t: now,
-        pos: [gripX, gripY, HIT_Z - FACE_OFF[2]],
+        pos: [gripX, gripY, serving ? SERVE_STAND_Z : HIT_Z - FACE_OFF[2]],
         q: [...Q],
       };
       duel.pushRacket(pose);
 
-      // 到点就挥。这一下只提供 Stroke，拍面位置已经由 pose 摆好了。
-      if (pred && duel.phase === 'live' && now - lastSubmit > 260) {
+      if (serving) {
+        // 抛球 → 等它过了最高点、落进击球区（`serveStrike` + `SERVE_REACH`）→ 挥。
+        //
+        // 「下落段才可打」是 `tossContact` 的硬条件：出手点本来就在击球区下方
+        // 不到一个判定半径，不卡这一条，脚本玩家会在抛出的那一帧就把球打出去。
+        //
+        // 判定中心必须用 `serveStrike`（握点锚点 + 拍面中心钳制），不能用拍面中心：
+        // 11-15 之后抛球点锚在身体前上方，横握时拍面中心在侧方 0.6m，
+        // 按拍面中心等球会**永远等不到**（球根本不去那儿）。
+        if (duel.phase === 'toss' && duel.ball.v[1] < 0) {
+          const sc = serveStrike(pose);
+          if (Math.abs(duel.ball.p[1] - sc[1]) < 0.3) {
+            const box = serveBox('player', duel.serveInfo.court);
+            const face = serveFace(sc, (box.x0 + box.x1) / 2, (box.z0 + box.z1) / 2);
+            // 挥拍方向**平行于拍面**：`shotFromStroke` 的旋转是 face×head 的切向分量，
+            // 两者一平行就没有侧旋。侧旋在这里是有毒的——发球落点被判在发球区内，
+            // 但球到对面击球面时已经被甩出 1.5m，回球机的 reachX 够不着，
+            // 于是每一分都变成「发球直接赢」，看不到任何回合。
+            duel.submit({
+              t: now,
+              peakW: 15,
+              head: [face[0] * 20, face[1] * 20, face[2] * 20],
+              speed: 14,
+              face,
+              grip: [0, 1, 0],
+              charge: 0.6,
+              used: false,
+            });
+            stat.swingsMade++;
+            stat.playerServes++;
+            lastSubmit = now;
+          }
+        }
+      } else if (pred && duel.phase === 'live' && now - lastSubmit > 260) {
         const tta = pred.t;
         if (tta > 0 && tta < SWING_LEAD) {
           // 玩家的出球也走求解器，但**只约束落点在对方场内**、不约束到面高度：
@@ -212,11 +302,15 @@ function run(level, cfg, seed, seconds) {
             console.log(
               `  [玩家击球#${stat.playerHits}] 接触点 (${e.at[0].toFixed(2)}, ${e.at[1].toFixed(2)}, ${e.at[2].toFixed(2)}) ` +
                 `v=(${v[0].toFixed(1)}, ${v[1].toFixed(1)}, ${v[2].toFixed(1)}) |v|=${Math.hypot(v[0], v[1], v[2]).toFixed(1)} ` +
-                `求解=(${lastAim.map((n) => n.toFixed(1)).join(', ')})`
+                `求解=(${lastAim ? lastAim.map((n) => n.toFixed(1)).join(', ') : '发球'})`
             );
           }
         } else if (e.kind === 'hit' && e.by === 'machine') {
           stat.machineHits++;
+          if (!e.serve && awaitReturn) {
+            stat.machineServeReturns++;
+            awaitReturn = false;
+          }
           if (TRACE && stat.machineHits <= 12) {
             console.log(
               `  [机器击球#${stat.machineHits}] 出球点 z=${e.at[2].toFixed(1)} y=${e.at[1].toFixed(2)} ` +
@@ -226,6 +320,14 @@ function run(level, cfg, seed, seconds) {
           }
         } else if (e.kind === 'serve') {
           stat.serves++;
+          if (e.by === 'player') awaitReturn = true;
+        } else if (e.kind === 'point') {
+          // 一分结束了还没被接回来 = 这一发接发球失败
+          awaitReturn = false;
+        } else if (e.kind === 'fault' && e.by === 'player') {
+          if (e.attempt === 1) stat.playerFault1++;
+          else stat.playerFault2++;
+          if (TRACE) console.log(`  [玩家发球失误] ${e.attempt}发 · ${e.reason}`);
         } else if (e.kind === 'out' && TRACE) {
           console.log(
             `  [出界·${e.by}] 落点 x=${e.at[0].toFixed(2)} z=${e.at[2].toFixed(2)} ` +
@@ -297,6 +399,13 @@ for (const { name, cfg } of picked) {
     serves: 0,
     aimNull: 0,
     swingsMade: 0,
+    /** 脚本玩家真正挥出去的发球数（抛球落下 → 挥到） */
+    playerServes: 0,
+    /** 玩家发球失误：一发 / 二发分开数，二发失误就是双误 */
+    playerFault1: 0,
+    playerFault2: 0,
+    /** 玩家的发球被回球机接回来的次数（与 `playerServes` 相除就是接发球成功率） */
+    machineServeReturns: 0,
   };
   const SEEDS = [11, 222, 3333, 44444, 555555, 6666666];
   for (const seed of SEEDS) {
@@ -309,6 +418,10 @@ for (const { name, cfg } of picked) {
     agg.serves += s.serves;
     agg.aimNull += s.aimNull;
     agg.swingsMade += s.swingsMade;
+    agg.playerServes += s.playerServes;
+    agg.playerFault1 += s.playerFault1;
+    agg.playerFault2 += s.playerFault2;
+    agg.machineServeReturns += s.machineServeReturns;
     for (const [k, v] of Object.entries(s.reasons)) agg.reasons[k] = (agg.reasons[k] || 0) + v;
     for (const [k, v] of Object.entries(s.machineMiss)) agg.machineMiss[k] += v;
   }
@@ -328,6 +441,11 @@ for (const { name, cfg } of picked) {
   console.log(`机器击球 ${agg.machineHits} 次 · 发球 ${agg.serves} 次`);
   console.log(`机器挥空 ${agg.machineMiss.timing} · 够不着 ${agg.machineMiss.reach} · 解不出 ${agg.machineMiss.solve}`);
   console.log(`玩家挥拍 ${agg.swingsMade} 次 · 求解失败 ${agg.aimNull} 次`);
+  const serveReturnPct = agg.playerServes ? (agg.machineServeReturns / agg.playerServes) * 100 : 0;
+  console.log(
+    `玩家发球 ${agg.playerServes} 次 · 一发失误 ${agg.playerFault1} · 二发失误（双误）${agg.playerFault2}` +
+      ` · 被接回来 ${agg.machineServeReturns}（${serveReturnPct.toFixed(0)}%）`
+  );
   console.log(`玩家够不着（握点被夹）${agg.playerReachIssue} 帧`);
   const rk = Object.keys(agg.reasons).sort((a, b) => agg.reasons[b] - agg.reasons[a]);
   for (const k of rk) console.log(`  ${k.padEnd(20)} ${agg.reasons[k]}`);
@@ -343,6 +461,13 @@ for (const { name, cfg } of picked) {
     `${label}：够不着/挥空/解不出（${machineFails}）少于成功回球（${agg.machineHits}）`
   );
   check(agg.aimNull * 2 < agg.serves + agg.swingsMade, `${label}：测试玩家自己求解失败不过半`);
+  // 发球必须能被接回来。这条是 4.24 那轮的教训：发球一旦发成「接不到的球」，
+  // 每一分都会变成「发球直接得分」，而所有旧断言都还是绿的（回合数不为 0 是因为
+  // 极少数球碰巧能接），直到有人去看「平均回合 0.0 拍」才暴露。
+  check(
+    agg.playerServes === 0 || agg.machineServeReturns * 4 >= agg.playerServes,
+    `${label}：玩家的发球有四分之一以上被接回来（${agg.machineServeReturns}/${agg.playerServes}）`
+  );
   if (argv.includes('--level') && levelArg === 2) {
     check(avg >= 2.5, `${label}：平均回合 ≥ 2.5 拍（实测 ${avg.toFixed(1)}）`);
   }

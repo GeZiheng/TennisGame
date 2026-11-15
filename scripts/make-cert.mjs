@@ -131,9 +131,9 @@ console.log('电脑上装一次根证书（之后所有浏览器都是绿锁）�
 console.log('  npm run trust');
 console.log('');
 console.log('手机上装一次根证书：');
-console.log('  1. 手机浏览器打开 https://<电脑IP>:5174/ca.crt 下载');
+console.log('  1. 手机浏览器打开 https://<电脑IP>:5184/ca.crt 下载');
 console.log('  2. iOS：设置 → 已下载描述文件 → 安装；再到 设置 → 通用 → 关于本机 →');
 console.log('     证书信任设置 → 打开对「Tennis P0 Local CA」的完全信任');
 console.log('     Android：设置 → 安全 → 加密与凭据 → 安装证书 → CA 证书');
 console.log('');
-for (const ip of ips) console.log(`  手机访问 → https://${ip}:5174/`);
+for (const ip of ips) console.log(`  手机访问 → https://${ip}:5184/`);

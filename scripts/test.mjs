@@ -34,9 +34,11 @@ execFileSync(
     'src/core/swing.ts',
     'src/core/racket.ts',
     'src/core/physics.ts',
-    'src/core/rally.ts',
     // 对打：回球机与状态机。两者都不碰 DOM，直接编成 CommonJS 跑。
     'src/core/machine.ts',
+    // 计分（分→局→盘）与发球几何都是纯函数 / 纯状态机，是最该被单测钉住的两块
+    'src/core/match.ts',
+    'src/core/serve.ts',
     'src/core/duel.ts',
     // 自动走位：纯函数（预测 + 限速步进），玩家侧唯一一段能单测的决策逻辑
     'src/core/auto-move.ts',

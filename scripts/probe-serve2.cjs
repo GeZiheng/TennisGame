@@ -9,8 +9,8 @@
  *
  * 这样不需要二维搜索：一次求解约 20 次模拟，比网格便宜两个数量级。
  */
-const { makeBall, advance } = require('../.tmp-sim/core/physics.js');
-const { HIT_Z, BALL_R, PHYS_DT } = require('../.tmp-sim/core/court.js');
+const { makeBall, advance } = require('../.tmp-duel/core/physics.js');
+const { HIT_Z, BALL_R, PHYS_DT } = require('../.tmp-duel/core/court.js');
 
 const Z0 = -11;
 const Y0 = 1.4;

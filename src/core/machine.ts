@@ -179,6 +179,22 @@ const HIT_Y_MAX = 2.2;
 const GIVE_UP_GAP = 0.75;
 
 /**
+ * 横向可及的额外余量（米）。
+ *
+ * 「预测量到 ±reachX+SLACK、真正摆拍却夹到 ±reachX」曾经是两处不同的数，
+ * 于是 3.0–3.6 之间成了一条**幽灵走廊**：`pickIntercept` 认为那些点可以去，
+ * 站位却只能到 3.0，`gap` 又是按夹过的目标算的（所以显示「我站好了」），
+ * 结果球从 0.4 米外擦过去、机器一次都没碰到。
+ *
+ * 平时看不出来：玩家回球的横向散布是 ±2.6，几乎不进那条走廊。发球一上线就暴露了——
+ * 发球是斜对角的，落在发球区中心的球到了底线附近已经飘到 ±3.4。
+ * 现在两处用同一个数。
+ */
+const REACH_SLACK = 0.6;
+/** 拍心横向能够到的绝对位置。站位、预测、放弃判据都用它。 */
+const reachLimit = (cfg: MachineConfig) => cfg.reachX + REACH_SLACK;
+
+/**
  * 回球到玩家拍面时的高度带：握点高度 +0…+0.3。
  *
  * 玩家握点 y 恒等于 `RACKET_POS[1]`=1.3（三路走位只搬 x/z，`setRacketBase` 传进去的
@@ -264,6 +280,16 @@ export class BallMachine {
     this.lastMiss = null;
   }
 
+  /**
+   * 换站位中心。
+   *
+   * 每一分都会调：接发球要站到「球要发去的那半边」，而不是钉在中线。
+   * 只改回中的目标点，不动当前位置——下一步由 `park()` 或 `moveToward` 搬过去。
+   */
+  setHome(x: number) {
+    this.homeX = x;
+  }
+
   /** 球开始朝它飞了。反应延迟从这里起算。 */
   beginPlay(now: number) {
     this.active = true;
@@ -337,7 +363,7 @@ export class BallMachine {
     }
 
     // 到面点 + 这一球的站位误差 → 理想拍心位置
-    const fx = clamp(p.x + this.errX, -cfg.reachX, cfg.reachX);
+    const fx = clamp(p.x + this.errX, -reachLimit(cfg), reachLimit(cfg));
     const fy = clamp(p.y + this.errY, GRIP_MIN_Y + FACE_CY, GRIP_MAX_Y + FACE_CY);
 
     // 反解握点：拍心要落在 (fx, fy, p.z) 上。
@@ -349,11 +375,12 @@ export class BallMachine {
     this.moveToward(target, cfg.moveSpeed * dt);
 
     // 到位了没有？没到位就是够不着——这是它唯一「努力但失败」的方式。
-    const gap = Math.hypot(
-      this.pos[0] - target[0],
-      this.pos[1] - target[1],
-      this.pos[2] - target[2]
-    );
+    //
+    // 量的是**拍心到球**的距离，不是「到理想站位点」的距离。这两种写法在横向/高度
+    // 被夹的时候会给出完全不同的答案：按夹过的目标点算，球跑到 3.4 米外、拍心只到
+    // 3.0，差值会被夹取吃掉，读出来是「我站好了」，然后挥空。
+    const face: V3 = [this.pos[0] + off[0], this.pos[1] + off[1], this.pos[2] + off[2]];
+    const gap = Math.hypot(p.x - face[0], p.y - face[1], p.z - face[2]);
 
     const remain = p.t - (now - this.predAt) / 1000;
     if (this.swingAt === null && remain <= cfg.swingLeadMs / 1000) {
@@ -414,7 +441,7 @@ export class BallMachine {
       }
 
       // 横向超出可及范围：这一站怎么跑都够不到
-      if (Math.abs(x) > cfg.reachX + 0.6) continue;
+      if (Math.abs(x) > reachLimit(cfg)) continue;
       // 时间够不够跑过去
       if (travel > cfg.moveSpeed * Math.max(0, t - reactLeft)) continue;
 
@@ -542,7 +569,7 @@ export class BallMachine {
     dx *= k;
     dy *= k;
     dz *= k;
-    this.pos[0] = clamp(this.pos[0] + dx, -this.cfg.reachX, this.cfg.reachX);
+    this.pos[0] = clamp(this.pos[0] + dx, -reachLimit(this.cfg), reachLimit(this.cfg));
     this.pos[1] = clamp(this.pos[1] + dy, GRIP_MIN_Y, GRIP_MAX_Y);
     this.pos[2] = clamp(this.pos[2] + dz, Z_FAR, Z_NEAR);
   }

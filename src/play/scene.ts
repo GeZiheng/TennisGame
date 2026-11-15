@@ -11,8 +11,6 @@ import {
   BASELINE_Z,
   NET_Z,
   SERVICE_Z,
-  WALL_Z,
-  WALL_H,
   OPP_BASELINE_Z,
   OPP_HIT_Z,
   BALL_RENDER_R,
@@ -38,17 +36,6 @@ const TRAIL_LEN = 20;
 const TMP_AXIS = new THREE.Vector3();
 
 /**
- * 场景模式。
- *
- * `wall` = 对墙打（默认，一行没改）：只有半场 + 对面的练习墙。
- * `duel` = 与脚本回球机对打：整场镜像出来、没有墙、多一支对手球拍。
- *
- * 为什么不用一个 `showWall` 布尔：两种模式的**相机、雾、场地线条、可交互对象**
- * 全都不同，写成布尔会在十几个地方散落 `if`。这里只有一处分支，其余靠字段。
- */
-export type SceneMode = 'wall' | 'duel';
-
-/**
  * 相机预设：**相对握点基座**的机位与视点（米）。
  *
  * 为什么做成预设而不是一个固定机位：玩家要的东西是互相矛盾的——看得清拍面
@@ -71,23 +58,12 @@ export interface CameraPreset {
   tgt: [number, number, number];
 }
 
-const CAMERA: Record<SceneMode, Record<'near' | 'far', CameraPreset>> = {
-  wall: {
-    // 近景：略偏右后方的过肩位，视点压在击球面稍前方，拍面和来球同时入画
-    near: { cam: [0.45, 1.85, 2.35], tgt: [0.05, 1.2, -1.0] },
-    // 全景：原来的机位，能看见整块半场和练习墙
-    far: { cam: [2.0, 2.3, 3.1], tgt: [0, 1.0, -3.9] },
-  },
-  duel: {
-    // 对打默认要一眼看到两侧底线，所以默认是全景；近景用来盯对手的来球
-    near: { cam: [0, 3.0, 4.3], tgt: [0, 1.05, -3.8] },
-    far: { cam: [0, 4.2, 6.9], tgt: [0, 0.9, -10.8] },
-  },
+const CAMERA: Record<'near' | 'far', CameraPreset> = {
+  // 近景用来盯对手的来球、看清球打在框上还是线上
+  near: { cam: [0, 3.0, 4.3], tgt: [0, 1.05, -3.8] },
+  // 全景能一眼看到两侧底线，对打默认用这一档
+  far: { cam: [0, 4.2, 6.9], tgt: [0, 0.9, -10.8] },
 };
-
-export interface SceneOptions {
-  mode?: SceneMode;
-}
 
 export class PlayScene {
   readonly renderer: THREE.WebGLRenderer;
@@ -102,6 +78,10 @@ export class PlayScene {
 
   /** 地面上的击球面提示条，跟着站位走 */
   private hitStrip!: THREE.Mesh;
+  /** 玩家发球时高亮的发球区（半个区，斜对角那个） */
+  private serveBoxMesh: THREE.Mesh | null = null;
+  /** 拍面指向的地面落点圈。发球时它就是「这一拍会落在哪」 */
+  private serveAimMesh: THREE.Mesh | null = null;
   private targetQ = new THREE.Quaternion();
   private smoothQ = new THREE.Quaternion();
   /**
@@ -122,9 +102,8 @@ export class PlayScene {
   private spinRad = 0;
   private camPreset: 'near' | 'far';
   /**
-   * 球按自己的弹道飞，不会在飞行途中被改向去追拍面；喂球只在落地弹起
-   * 那一刻瞄一次（`Rally.aimArrival`）。挥拍时拍面扫出去的那段缺口由玩家
-   * 自己对准，不再由球补偿。
+   * 球按自己的弹道飞，不会在飞行途中被改向去追拍面——回球机在出球那一刻就把
+   * 落点定死了。挥拍时拍面扫出去的那段缺口由玩家自己对准，不再由球补偿。
    */
   private clock = new THREE.Clock();
   /**
@@ -143,14 +122,10 @@ export class PlayScene {
   private glow = 0;
   private ballSpin: V3 = [0, 0, 0];
 
-  readonly mode: SceneMode;
-  /** 对手的球拍。`wall` 模式恒为 null。 */
+  /** 对手（脚本回球机）的球拍。 */
   private oppRacket: THREE.Group | null = null;
 
-  constructor(canvas: HTMLCanvasElement, opts: SceneOptions = {}) {
-    this.mode = opts.mode ?? 'wall';
-    const duel = this.mode === 'duel';
-
+  constructor(canvas: HTMLCanvasElement) {
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
     this.renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     this.renderer.shadowMap.enabled = true;
@@ -158,8 +133,9 @@ export class PlayScene {
 
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color('#f7f7f5');
-    // 对打的场地是墙打的四倍长，雾的远端必须往后推，否则对手整支拍子被雾吃掉。
-    this.scene.fog = duel ? new THREE.Fog('#f7f7f5', 22, 70) : new THREE.Fog('#f7f7f5', 14, 34);
+    // 场地是「我这边 + 对面」两块拼起来的，雾的远端必须推到对手底线之外，
+    // 否则整支对手拍子会被雾吃掉。
+    this.scene.fog = new THREE.Fog('#f7f7f5', 22, 70);
 
     this.camera = new THREE.PerspectiveCamera(50, 1, 0.05, 120);
 
@@ -170,10 +146,10 @@ export class PlayScene {
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.08;
     this.controls.minDistance = 1.5;
-    this.controls.maxDistance = duel ? 32 : 9;
+    this.controls.maxDistance = 32;
     this.controls.maxPolarAngle = Math.PI * 0.495;
     // 机位由预设决定（见 CAMERA），`Z` 键在两档之间切；鼠标滚轮仍然可以微调
-    this.camPreset = duel ? 'far' : 'near';
+    this.camPreset = 'far';
     this.applyCamera();
 
     this.scene.add(new THREE.HemisphereLight('#ffffff', '#d9d5c8', 1.4));
@@ -184,18 +160,17 @@ export class PlayScene {
     key.shadow.mapSize.set(1024, 1024);
     key.shadow.camera.near = 0.5;
     key.shadow.camera.far = 16;
-    key.shadow.camera.left = duel ? -14 : -3;
-    key.shadow.camera.right = duel ? 14 : 3;
-    key.shadow.camera.top = duel ? 14 : 3;
-    key.shadow.camera.bottom = duel ? -14 : -3;
+    key.shadow.camera.left = -14;
+    key.shadow.camera.right = 14;
+    key.shadow.camera.top = 14;
+    key.shadow.camera.bottom = -14;
     key.shadow.bias = -0.0008;
     // 球拍本来就悬在半空（它是一支虚拟球拍），阴影太重会看着像地上还有一支
     (key.shadow as any).intensity = 0.4;
     this.scene.add(key);
 
     this.buildGround();
-    if (duel) this.buildOpponent();
-    else this.buildWall();
+    this.buildOpponent();
     this.buildHitZone();
 
     this.racket = new THREE.Group();
@@ -263,22 +238,20 @@ export class PlayScene {
     };
 
     const W = HALF_WIDTH;
-    const duel = this.mode === 'duel';
-    // 对打：边线一直拉到对面底线，其余线条按球网镜像一份。
-    const zFar = duel ? OPP_BASELINE_Z : NET_Z;
-    const svc = duel ? 2 * NET_Z - SERVICE_Z : SERVICE_Z;
+    // 边线一直拉到对面底线，其余线条按球网镜像一份。整块场地 = 我这边 + 对面，
+    // 球网在中间——这不是「画两面墙」，是同一片场地的两半。
+    const zFar = OPP_BASELINE_Z;
+    const svc = 2 * NET_Z - SERVICE_Z;
     seg(-W, BASELINE_Z, W, BASELINE_Z, 0.08); // 底线
     seg(-W, BASELINE_Z, -W, zFar); // 单打边线
     seg(W, BASELINE_Z, W, zFar);
     seg(-W, SERVICE_Z, W, SERVICE_Z, 0.05); // 发球线
     seg(0, SERVICE_Z, 0, NET_Z, 0.05); // 中央发球线
     seg(-0.16, BASELINE_Z, 0.16, BASELINE_Z, 0.09); // 中点标记
-    if (duel) {
-      seg(-W, OPP_BASELINE_Z, W, OPP_BASELINE_Z, 0.08);
-      seg(-W, svc, W, svc, 0.05);
-      seg(0, svc, 0, NET_Z, 0.05);
-      seg(-0.16, OPP_BASELINE_Z, 0.16, OPP_BASELINE_Z, 0.09);
-    }
+    seg(-W, OPP_BASELINE_Z, W, OPP_BASELINE_Z, 0.08);
+    seg(-W, svc, W, svc, 0.05);
+    seg(0, svc, 0, NET_Z, 0.05);
+    seg(-0.16, OPP_BASELINE_Z, 0.16, OPP_BASELINE_Z, 0.09);
 
     // 网：用程序生成的网格纹理，比一块半透明色块更像网
     const c = document.createElement('canvas');
@@ -366,55 +339,6 @@ export class PlayScene {
     if (this.oppGlow) {
       this.oppGlow.position.set(pose.pos[0], pose.pos[1] + FACE_CY, pose.pos[2]);
     }
-  }
-
-  /** 对面的练习墙。必须画出来，否则玩家不知道球为什么会在那里弹回来。 */
-  private buildWall() {
-    const w = HALF_WIDTH * 2 + 1.2;
-
-    const c = document.createElement('canvas');
-    c.width = 256;
-    c.height = 128;
-    const cx = c.getContext('2d')!;
-    cx.fillStyle = '#cfd4cb';
-    cx.fillRect(0, 0, 256, 128);
-    cx.strokeStyle = 'rgba(255,255,255,0.55)';
-    cx.lineWidth = 2;
-    for (let i = 0; i <= 256; i += 32) {
-      cx.beginPath();
-      cx.moveTo(i, 0);
-      cx.lineTo(i, 128);
-      cx.stroke();
-    }
-    for (let j = 0; j <= 128; j += 32) {
-      cx.beginPath();
-      cx.moveTo(0, j);
-      cx.lineTo(256, j);
-      cx.stroke();
-    }
-    // 一条横贯的目标带，给「打高一点」一个视觉参照
-    cx.fillStyle = 'rgba(22,110,86,0.22)';
-    cx.fillRect(0, 128 - 78, 256, 26);
-
-    const tex = new THREE.CanvasTexture(c);
-    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-    tex.repeat.set(3, 1);
-    tex.anisotropy = 4;
-
-    const wall = new THREE.Mesh(
-      new THREE.PlaneGeometry(w, WALL_H),
-      new THREE.MeshStandardMaterial({ map: tex, roughness: 0.95 })
-    );
-    wall.position.set(0, WALL_H / 2, WALL_Z);
-    wall.receiveShadow = true;
-    this.scene.add(wall);
-
-    const top = new THREE.Mesh(
-      new THREE.BoxGeometry(w, 0.08, 0.08),
-      new THREE.MeshStandardMaterial({ color: '#eef0ec', roughness: 0.8 })
-    );
-    top.position.set(0, WALL_H, WALL_Z);
-    this.scene.add(top);
   }
 
   /**
@@ -668,6 +592,72 @@ export class PlayScene {
     this.ballSpin = spin;
   }
 
+  /**
+   * 玩家发球时高亮目标发球区，其余时候传 null。
+   *
+   * 发球区是**斜对角**的那半个：从右区发到对面的右区。这件事只有画出来
+   * 才看得懂——靠文字说「右区」没几个人能立刻对上。
+   */
+  setServeBox(box: { x0: number; x1: number; z0: number; z1: number } | null) {
+    if (!box) {
+      if (this.serveBoxMesh) this.serveBoxMesh.visible = false;
+      return;
+    }
+    if (!this.serveBoxMesh) {
+      const mesh = new THREE.Mesh(
+        new THREE.PlaneGeometry(1, 1),
+        new THREE.MeshBasicMaterial({
+          color: '#3aa07d',
+          transparent: true,
+          opacity: 0.16,
+          depthWrite: false,
+          side: THREE.DoubleSide,
+        })
+      );
+      mesh.rotation.x = -Math.PI / 2;
+      mesh.position.y = 0.005;
+      mesh.visible = false;
+      this.scene.add(mesh);
+      this.serveBoxMesh = mesh;
+    }
+    const m = this.serveBoxMesh;
+    m.visible = true;
+    m.scale.set(Math.abs(box.x1 - box.x0), Math.abs(box.z1 - box.z0), 1);
+    m.position.set((box.x0 + box.x1) / 2, 0.005, (box.z0 + box.z1) / 2);
+  }
+
+  /**
+   * 拍面指向的地面落点。`inBox` 决定颜色：落在正确的发球区里是绿的，
+   * 出区是红的——玩家在抛球之前就能看到自己瞄对了没有。
+   */
+  setServeAim(p: V3 | null, inBox: boolean) {
+    if (!p) {
+      if (this.serveAimMesh) this.serveAimMesh.visible = false;
+      return;
+    }
+    if (!this.serveAimMesh) {
+      const mesh = new THREE.Mesh(
+        new THREE.RingGeometry(0.3, 0.42, 40),
+        new THREE.MeshBasicMaterial({
+          color: '#2f9e6f',
+          transparent: true,
+          opacity: 0.75,
+          depthWrite: false,
+          side: THREE.DoubleSide,
+        })
+      );
+      mesh.rotation.x = -Math.PI / 2;
+      mesh.position.y = 0.012;
+      mesh.visible = false;
+      this.scene.add(mesh);
+      this.serveAimMesh = mesh;
+    }
+    const m = this.serveAimMesh;
+    m.visible = true;
+    m.position.set(p[0], 0.012, p[2]);
+    (m.material as THREE.MeshBasicMaterial).color.set(inBox ? '#2f9e6f' : '#cf5b5b');
+  }
+
   /** 球穿过击球面时的冲击环。 */
   spawnHitFx(p: V3, charge: number) {
     const fx = this.takeFx('#3aa07d');
@@ -828,7 +818,7 @@ export class PlayScene {
 
   /** 按当前预设摆机位。机位是相对**基座**的，所以走位之后切档也不会跑到场外。 */
   private applyCamera() {
-    const p = CAMERA[this.mode][this.camPreset];
+    const p = CAMERA[this.camPreset];
     // 换档是「重新摆机位」，不能还欠着上一段的追赶量，否则会多搬一次
     this.camLag.set(0, 0, 0);
     this.camera.position.set(

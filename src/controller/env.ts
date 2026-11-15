@@ -96,9 +96,9 @@ export function diagnose(): { facts: EnvFacts; issues: EnvIssue[] } {
         'Chrome 和 Safari 只在「安全上下文」里开放运动传感器——也就是 HTTPS，或者 localhost。用局域网 IP 走 http 一律被静默拦截。',
       steps: [
         '在电脑上停掉当前服务，改用 npm run dev:https 启动（会自动生成带局域网 IP 的证书）',
-        '用终端打印的 https://192.168.x.x:5174 重新打开大屏，让手机扫那个新二维码',
+        '用终端打印的 https://192.168.x.x:5184 重新打开大屏，让手机扫那个新二维码',
         '手机上首次打开会提示证书不受信任，选「继续访问」（iOS 是「显示详细信息 → 访问此网站」）',
-        '想彻底去掉红锁：浏览器打开 https://<电脑IP>:5174/ca.crt 装上根证书，见 README',
+        '想彻底去掉红锁：浏览器打开 https://<电脑IP>:5184/ca.crt 装上根证书，见 README',
       ],
     });
   }

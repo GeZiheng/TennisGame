@@ -5,15 +5,14 @@ import basicSsl from '@vitejs/plugin-basic-ssl';
 import { lanDev } from './server/vite-plugin.ts';
 
 /**
- * 两种模式各起一个服务的配置工厂。
- *
- * 为什么不共用端口：两种模式的**信令房间名空间是同一个**（`server/rooms.ts` 按
- * 房间号配对），共用端口时同时开两个大屏窗口会互相抢手机。分开端口之后
- * 每条服务有自己的房间表，一台机器上可以同时开两个窗口分别打。
+ * dev server 配置工厂：两个入口文件（`vite.config.ts` / `vite.config.https.ts`）共用。
  *
  * 端口表：
- *   5173 对墙打 http      5174 对墙打 https
- *   5183 对打   http      5184 对打   https
+ *   5183 http      5184 https
+ *
+ * 为什么 http / https 是两个端口而不是一个：两条服务各自持有一张信令房间表
+ * （`server/rooms.ts` 按房间号配对），同一端口切协议会互相踢。现在只剩一种模式，
+ * 但这一层是「协议」不是「模式」，所以保留。
  *
  * https 是必须的：iOS / Android 都只在安全上下文里开放运动传感器。
  */
@@ -24,41 +23,10 @@ const keyPath = resolve(certDir, 'dev-key.pem');
 const certPath = resolve(certDir, 'dev-cert.pem');
 const hasCert = existsSync(keyPath) && existsSync(certPath);
 
-/**
- * 把 `/` 指向某个页面。
- *
- * 对打服务如果照旧返回 `index.html`，打开根地址会进到墙打——这不是小问题：
- * 玩家会以为「对打模式没生效」，而其实只是看错了入口。
- *
- * 在 `configureServer` 里直接 `use` 的中间件排在 vite 内部中间件**之前**，
- * 所以改写能生效；写成返回值就是「后置」，那时候静态文件已经发出去了。
- */
-function homePage(page: string) {
-  return {
-    name: 'home-page',
-    configureServer(server: any) {
-      if (page === 'index.html') return;
-      server.middlewares.use((req: any, _res: any, next: any) => {
-        if (req.url === '/' || req.url === '/index.html') req.url = `/${page}`;
-        next();
-      });
-    },
-  };
-}
-
-export function tennisConfig(opts: {
-  port: number;
-  https: boolean;
-  /** 根地址打开的页面。对打服务指向 duel.html。 */
-  home?: string;
-}): UserConfig {
+export function tennisConfig(opts: { port: number; https: boolean }): UserConfig {
   const secure = opts.https && hasCert;
   return defineConfig({
-    plugins: [
-      homePage(opts.home ?? 'index.html'),
-      ...(opts.https && !hasCert ? [basicSsl()] : []),
-      lanDev(),
-    ],
+    plugins: [...(opts.https && !hasCert ? [basicSsl()] : []), lanDev()],
     server: {
       host: true,
       port: opts.port,
@@ -68,8 +36,9 @@ export function tennisConfig(opts: {
       target: 'es2022',
       rollupOptions: {
         input: {
+          // 大屏（对打）与手机控制器。曾经还有一个 index.html 给对墙打用，
+          // 11-15 删模式之后 `/` 就是游戏本身。
           play: 'index.html',
-          duel: 'duel.html',
           controller: 'controller.html',
         },
       },

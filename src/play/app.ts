@@ -1,5 +1,5 @@
 import QRCode from 'qrcode';
-import { PlayScene, type SceneMode } from './scene';
+import { PlayScene } from './scene';
 import { Sfx } from './audio';
 import { Link, randomRoom, type LinkState } from '../net/link';
 import {
@@ -10,10 +10,11 @@ import {
 } from '../core/protocol';
 import { LatencyWindow, PacketStats, ClockSync } from './stats';
 import { SwingDetector } from '../core/swing';
-import { Rally, type RallyEvent } from '../core/rally';
 import { Duel, type DuelEvent } from '../core/duel';
 import { FACE_CY, HIT_WINDOW_MS, RACKET_POS } from '../core/court';
-import { faceCenter } from '../core/racket';
+import { faceCenter, frontFace } from '../core/racket';
+import { serveAim, serveBox, serveStrike, SERVE_STAND_Z } from '../core/serve';
+import { vrot } from '../core/vec';
 import {
   AUTO_MOVE_DEFAULTS,
   blendCenterOffset,
@@ -28,14 +29,12 @@ import { MockController } from './mock';
 /**
  * 一局游戏的**完整前端**：连接、收包、挥拍检测、走位、渲染、HUD。
  *
- * 墙打和对打共用这一份，靠 `startPlay(mode)` 参数化。分成两个文件会立刻变成
- * 700 行 × 2 份互相漂移的拷贝——网络那一段（时钟同步、重连复位、姿态连续性）
- * 是这个项目里最贵的代码，它只能有一份。
+ * 只有对打一种模式（对墙打在 11-15 删掉了，见 `docs/history.md` 4.27）。这一份
+ * 文件同时是「网络那一段」的唯一实现——时钟同步、重连复位、姿态连续性、抢跑取拍，
+ * 是这个项目里最贵也最爱出错的代码，它不该有第二个拷贝。
  *
- * 差异只有三处，都收在 `startPlay` 里：
- *   1. 场景（`PlayScene` 的 mode：整场 + 对手球拍 vs 半场 + 练习墙）
- *   2. 规则对象（`Duel` vs `Rally`）
- *   3. HUD 的主数字（比分 vs 连拍）
+ * 分工：`core/duel.ts` 是规则（分 → 局 → 盘、两次发球），`core/machine.ts` 是对手，
+ * `core/auto-move.ts` 是走位，`scene.ts` 是画面。这里只负责把它们串成一条主循环。
  */
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -66,9 +65,8 @@ const liveStroke = (near: number) => {
   return live;
 };
 
-/** 当前规则对象。墙打是 `Rally`，对打是 `Duel`。 */
-let game: Rally | Duel;
-const isDuel = () => game instanceof Duel;
+/** 规则对象。只有一个实现者，但保留具名变量：主循环里出现 `game.` 比 `duel.` 更说明意图。 */
+let game: Duel;
 
 const latency = new LatencyWindow();
 /** 采样 → 处理 的整条链路，比 latency 多出手机端的采样与发包等待 */
@@ -103,14 +101,15 @@ let autoMove = qs.get('auto') !== '0';
  *
  * 它把握点从「钉在原地」改成「绕腰/肘走一段弧」，所以拍面中心在挥拍中会平移
  * 最多 0.18m（`maxShift`）。判定是扫掠的、位移也限了幅，模拟器 A/B 里命中率
- * 没有变化（`RIG=1 node scripts/sim-e2e.cjs`），但「手感对不对」只有真机能回答。
+ * 没有变化（`npm run duel-sim` 开关两档的回合数差在噪声内），但「手感对不对」
+ * 只有真机能回答。
  */
 let rigOn = qs.get('rig') !== '0';
 
 /**
  * 瞄准点学习（11-14 晚）：默认开，`?aim=rest` 关掉（回到「瞄站着不动的拍面」）。
  *
- * 留这个开关是因为它改的是**喂球瞄哪儿**，不只是走位：关掉之后球会飞回老地方，
+ * 留这个开关是因为它改的是**人往哪儿站**：关掉之后走位瞄的是「站着不动时的拍面」，
  * 真机 A/B 才有对照组。没有绑键位——它是「这一局怎么打」的选择，不是临场动作。
  */
 let aimLearn = qs.get('aim') !== 'rest';
@@ -134,16 +133,17 @@ let aimLearn = qs.get('aim') !== 'rest';
  *    学一次（`learnContact`）。挥拍 40–80° 会把中心扫出 40–60cm，比判定盘还宽；
  *    不补这一段，走位瞄的就是「我站着不动时的拍面」。
  *
- * 两份偏移都必须**同时**喂给走位（`planAutoMove`）和喂球（`Rally.setFaceAimOffset`）：
- * 只改一边的话，球会被瞄到另一个点上，而且每球累积一次，人会一路被推到边界
- * （`docs/history.md` 4.23）。
+ * 两份偏移都喂给走位（`planAutoMove` 的 `center`）。墙打时代还要**同时**喂给喂球，
+ * 否则球会被瞄到另一个点上、每球累积一次把人推到边界（`docs/history.md` 4.23）；
+ * 11-15 删掉墙打之后来球由回球机自己算（瞄固定高度带，不看玩家拍面），
+ * 这一半约束随之消失（4.27）。
  */
 const restOffset: [number, number, number] = [0, FACE_CY, 0];
 /** 平滑后的「击球瞬间 − 站着不动」偏移，逐帧朝 `contactWant` 收敛。 */
 const contactDelta: [number, number, number] = [0, 0, 0];
 /** 上一拍学到的目标值。只在新命中时更新，所以两拍之间是一条直线。 */
 const contactWant: [number, number, number] = [0, 0, 0];
-/** 走位与喂球共用的瞄准偏移 = `restOffset + contactDelta`。 */
+/** 走位用的瞄准偏移 = `restOffset + contactDelta`。 */
 const planOffset: [number, number, number] = [0, FACE_CY, 0];
 /** 学到的样本数：0 表示还没命中过，此时 `planOffset` 就是老行为。 */
 let contactSamples = 0;
@@ -169,9 +169,9 @@ function updateCenterOffset(pose: ReturnType<PlayScene['syncRacket']>, dt: numbe
     contactDelta[i] += (contactWant[i] - contactDelta[i]) * k;
     planOffset[i] = restOffset[i] + contactDelta[i];
   }
-  // 喂球必须用同一份偏移（见上）。对打的来球是对手回球机打的，不看玩家拍面，
-  // 所以只有墙打需要同步。
-  if (game instanceof Rally) game.setFaceAimOffset(planOffset);
+  // 对打的来球是回球机打的、不看玩家拍面，所以这里**不需要**再往里喂一份偏移。
+  // 墙打时代这一行是 `Rally.setFaceAimOffset(planOffset)`，删模式时一起去掉了；
+  // `Duel` 没有对应接口是有意的，不是漏了。
 }
 
 /**
@@ -284,7 +284,7 @@ let lastImuSeq = -1;
  *     ±150ms 窗口一条都匹配不上，连 `peekLive` 抢跑也一起失效；
  *   - `lastImuSeq` 停在旧的大序号，新会话的包全被当成乱序旧包丢掉，拍子僵住；
  *   - `SwingDetector` 里可能还留着上次挥到一半的 armed 峰，会被 `peekLive`
- *     当成「正在挥」误取；`Rally.pending` 里则是时间轴已经错掉的旧挥拍。
+ *     当成「正在挥」误取；`Duel.pending` 里则是时间轴已经错掉的旧挥拍。
  *
  * 这些都不属于「一局游戏」，换人就该清零。姿态平滑（`smoothQ`）不清：新会话
  * 第一包到了会在 22ms 内收敛过去，强行归位反而让拍子凭空跳一下。
@@ -372,80 +372,63 @@ let lastSpeed = 0;
 let lastShot = '—';
 
 /**
- * 主数字：墙打是连拍，对打是比分。
+ * 主数字：**本局比分**（0 / 15 / 30 / 40 / AD，抢七是数字）。
  *
- * HUD 的节点是共用的（两个页面都是同一套 class），所以这里只换显示内容，
+ * HUD 的节点是固定的（`index.html` 里那一套 id），所以这里只换显示内容，
  * 不换 DOM 结构——多一套节点就多一份会跟主循环失去同步的缓存。
  */
 function primaryText(): string {
-  return isDuel()
-    ? `${(game as Duel).score.player}:${(game as Duel).score.machine}`
-    : String((game as Rally).streak);
+  // 一盘结束之后主数字改成局分：那才是「这一场」的最终结果
+  if (game.match.over) return `${game.match.games[0]}:${game.match.games[1]}`;
+  return `${game.pointText('player')}:${game.pointText('machine')}`;
 }
 
-/** 副数字：墙打是「最好」，对打是「最长回合」。 */
+/** 副数字：**局分**。 */
 function secondaryText(): string {
-  return String(isDuel() ? (game as Duel).bestRally : (game as Rally).best);
+  return `${game.match.games[0]}:${game.match.games[1]}`;
 }
 
 /**
- * 事件分发。两种模式的事件类型不同，但共享 `kind` 判别标签，
- * 所以按 kind 分支、再在 hit 里看有没有 `by` 字段区分是谁打的。
+ * 事件分发。
+ *
+ * 两种模式合并成一种之后，这里最大的简化是：**每个事件都带 `by`**。墙打时代
+ * 要用 `'by' in e` 区分「这一拍是谁打的」（因为墙打的事件里没有这个字段），
+ * 现在不用了。
  */
-function handle(e: RallyEvent | DuelEvent) {
+function handle(e: DuelEvent) {
   switch (e.kind) {
     case 'hit': {
-      // 命中那一刻的拍面姿态 = 下一拍该瞄的地方。见 `learnContact`。
-      if (lastPose && (!('by' in e) || e.by === 'player')) learnContact(lastPose);
-      if ('by' in e) {
-        // 对打：谁打的要区分——对手那一拍音效压低一点，否则听不出回合归属
-        sfx.hit(e.by === 'player' ? 0.7 : 0.4, e.clean);
-        scene.spawnHitFx(e.at, e.by === 'player' ? 0.7 : 0.45);
-        if (e.by === 'player') lastSpeed = e.speed;
-        flashPrimary(false);
-      } else {
-        sfx.hit(e.charge, e.clean);
-        scene.spawnHitFx(e.at, e.charge);
+      // 发球那一拍不算「击球姿态」：它是举着拍子在头上打的，学进 `learnContact`
+      // 会把地面击球的瞄准点带偏（那一层学的是「拍面扫出去多少」）。
+      if (lastPose && e.serve !== true && e.by === 'player') learnContact(lastPose);
+      // 谁打的要区分——对手那一拍音效压低一点，否则听不出回合归属
+      sfx.hit(e.by === 'player' ? 0.7 : 0.4, e.clean);
+      scene.spawnHitFx(e.at, e.by === 'player' ? 0.7 : 0.45);
+      if (e.by === 'player') {
         lastSpeed = e.speed;
-        lastShot = !e.clean
-          ? '拍面没打开'
-          : e.topSpin > 60
-            ? '上旋'
-            : e.topSpin < -60
-              ? '下旋'
-              : '平击';
-        flashPrimary(false);
+        // 拍型只有玩家那一拍有意义：对手的出球是求解器直接给的，没有「上旋/平击」
+        lastShot = e.serve ? '发球' : e.clean ? '击球' : '拍面没打开';
       }
+      flashPrimary(false);
       break;
     }
     case 'ground':
-      sfx.bounce('speed' in e ? e.speed : 4);
+      // `DuelEvent` 的落地事件不带速度（墙打时代那一个是撞墙/擦地的合成事件）
+      sfx.bounce(4);
       scene.spawnBounceFx(e.at);
       break;
-    case 'wall':
-      sfx.wall(e.speed);
-      break;
     case 'net':
-      if (!('by' in e) || e.by === 'player') noteMiss();
+      if (e.by === 'player') noteMiss();
       sfx.net();
       break;
     case 'out':
-      if ('by' in e) {
-        lastShot = '出界';
-        flashHint(e.by === 'player' ? '出界了' : '对手打出界');
-      }
+      lastShot = '出界';
+      flashHint(e.by === 'player' ? '出界了' : '对手打出界');
       break;
     case 'miss':
-      // 对打里对手漏接也会走到这里，只有玩家的漏接能说明「瞄准学歪了」
-      if (!('by' in e) || e.by === 'player') noteMiss();
-      flashHint(e.reason === 'reach' ? '够不着，球从身边过去了' : '挥晚了');
-      break;
-    case 'streak':
-      flashPrimary(true);
-      break;
-    case 'end':
-      sfx.end();
-      flashHint(`断了，这一轮 ${e.value} 拍`);
+      // 对手漏接也会走到这里，只有玩家的漏接能说明「瞄准学歪了」
+      if (e.by === 'player') noteMiss();
+      flashHint(e.reason === 'stop' ? '球停在拍面上了' : '两跳，球在你这边落了两次');
       break;
     case 'point':
       sfx.end();
@@ -453,9 +436,44 @@ function handle(e: RallyEvent | DuelEvent) {
       flashHint(`${e.winner === 'player' ? '你' : '对手'}得分 · ${e.reason}`);
       flashPrimary(true);
       break;
-    case 'serve':
-      if (isDuel()) flashHint('对手发球');
+    case 'fault': {
+      // 二发的失误由紧跟其后的 point 事件播报（「双误」），这里不抢话。
+      if (e.attempt === 1) {
+        const why: Record<string, string> = {
+          out: '出界',
+          net: '下网',
+          short: '没过网',
+          nohit: '没挥到球',
+          stop: '没打出去',
+        };
+        const text = why[e.reason] ?? e.reason;
+        flashHint(e.by === 'player' ? `一发失误（${text}）· 还有一次` : `对手一发失误（${text}）`);
+      }
+      if (e.reason === 'net') sfx.net();
       break;
+    }
+    case 'game':
+      sfx.end();
+      flashHint(e.winner === 'player' ? '这一局拿下' : '这一局被对手拿下');
+      break;
+    case 'tiebreak':
+      flashHint('6:6 · 抢七，先到 7 分', 2600);
+      break;
+    case 'matchOver':
+      sfx.end();
+      lastShot = '比赛结束';
+      flashHint(
+        `${e.winner === 'player' ? '你赢了这一盘' : '对手赢了这一盘'} ${e.games[0]}:${e.games[1]} · 按 C 重开`,
+        6000
+      );
+      flashPrimary(true);
+      break;
+    case 'serve': {
+      const who = e.by === 'player' ? '你发球' : '对手发球';
+      const court = e.court === 'deuce' ? '右区' : '左区';
+      flashHint(`${who} · ${e.attempt === 1 ? '一发' : '二发'} · ${court}`);
+      break;
+    }
   }
 }
 
@@ -474,12 +492,16 @@ function flashPrimary(strong: boolean) {
 }
 
 let hintTimer = 0;
-function flashHint(text: string) {
+/**
+ * @param ms 显示时长。默认 1600ms（够读一句「出界了」），但「抢七」「这盘结束」
+ *   这类要读两行、还要带操作提示的话，1.6 秒会一闪而过。
+ */
+function flashHint(text: string, ms = 1600) {
   const el = $<HTMLElement>('s-hint');
   el.textContent = text;
   el.classList.add('show');
   clearTimeout(hintTimer);
-  hintTimer = window.setTimeout(() => el.classList.remove('show'), 1600);
+  hintTimer = window.setTimeout(() => el.classList.remove('show'), ms);
 }
 
 function updateHud() {
@@ -541,10 +563,14 @@ function updateHud() {
     faceEl.className = 'v';
   } else {
     const [qx, qy, qz, qw] = lastPose.q;
-    // q 作用在 (0,0,1) 上：即设备屏幕法线在世界系里的方向
-    const fx = 2 * (qx * qz + qw * qy);
-    const fy = 2 * (qy * qz - qw * qx);
-    const fz = 1 - 2 * (qx * qx + qy * qy);
+    // q 作用在 (0,0,1) 上：即设备屏幕法线在世界系里的方向。
+    // 拍子是双面的，反手时这根法线指着身后——先翻成朝球场那一面再算偏角，
+    // 否则反手位会一直读到「180°」，看着像握歪了，其实那是正常的背面。
+    const [fx, fy, fz] = frontFace([
+      2 * (qx * qz + qw * qy),
+      2 * (qy * qz - qw * qx),
+      1 - 2 * (qx * qx + qy * qy),
+    ]);
     if (Math.abs(fy) > 0.75) {
       // 拍面几乎水平：这时候「水平偏角」没有意义，直接说明朝上/朝下
       faceEl.textContent = fy > 0 ? '朝上' : '朝下';
@@ -682,9 +708,8 @@ async function boot() {
   if (insecure) {
     warn.hidden = false;
     warn.textContent =
-      `当前是 HTTP 模式，手机浏览器不会把传感器交给网页。真机测试请改用 npm run ${
-        isDuel() ? 'dev:duel:https' : 'dev:https'
-      }，并在 https://localhost:${location.port ? Number(location.port) + 1 : 5174} 打开本页。`;
+      `当前是 HTTP 模式，手机浏览器不会把传感器交给网页。真机测试请改用 npm run dev:https，` +
+      `并在 https://localhost:${location.port ? Number(location.port) + 1 : 5184} 打开本页。`;
   }
 
   await QRCode.toCanvas(qrEl, url, {
@@ -737,8 +762,10 @@ const PLAYER = {
   x: AUTO_MOVE_DEFAULTS.homeX,
   y: RACKET_POS[1],
   z: AUTO_MOVE_DEFAULTS.homeZ,
-  /** 手动走位速度。真实球员横移 4–5 m/s，取 4.2 让「跑不到位」是一种失误但不算苛刻。 */
-  speed: 4.2,
+  /** 手动走位速度。和自动走位同一档：手动不该比自动更慢，否则按键跑位必然漏球。 */
+  speed: AUTO_MOVE_DEFAULTS.speed,
+  /** 手动前后移动速度。和 `AUTO_MOVE_DEFAULTS.speedZ` 同源：倒退总比横移慢。 */
+  speedZ: AUTO_MOVE_DEFAULTS.speedZ,
   // 站位范围只在 `AUTO_MOVE_DEFAULTS` 里定义一次：自动走位要按同一组边界选点，
   // 两处各写一份迟早会漂。
   maxX: AUTO_MOVE_DEFAULTS.maxX,
@@ -754,6 +781,26 @@ const targetHold = new TargetHold();
 const held = new Set<string>();
 
 function updatePlayer(dt: number) {
+  // 发球站位优先于一切输入：发球是**站位固定**的动作，一边跑一边发不是网球。
+  // `Duel` 也按同一个位姿判「站好了没有」（`playerAtStance`），所以这里搬到哪儿、
+  // 判定就认哪儿——两处用的是同一个 `PLAYER`，不另算一份。
+  {
+    const sx = game.playerServeStanceX;
+    if (sx !== null) {
+      // 握点举到 `RACKET_POS[1] + 0.32`：发球的拍面在头上，而 `playerAtStance`
+      // 要求握点高过 `+0.25`。举拍是手臂动作，用 `speedY` 那一档，立刻到位。
+      const ty = Math.min(PLAYER.maxY, RACKET_POS[1] + 0.32);
+      PLAYER.x = stepAxis(PLAYER.x, sx, PLAYER.speed * dt, 0.02);
+      PLAYER.z = stepAxis(PLAYER.z, SERVE_STAND_Z, PLAYER.speedZ * dt, 0.02);
+      PLAYER.y = stepAxis(PLAYER.y, ty, AUTO_MOVE_DEFAULTS.speedY * dt, 0.005);
+      scene.setRacketBase(PLAYER.x, PLAYER.y, PLAYER.z);
+      // 站位是有意的位移，不是自动走位追球：保持器得忘掉上一分的目标，
+      // 否则下一分开球的第一次追球会被 10cm 的死区吃掉。
+      targetHold.reset();
+      return;
+    }
+  }
+
   let ax = 0;
   let az = 0;
   if (held.has('a') || held.has('arrowleft')) ax -= 1;
@@ -812,6 +859,44 @@ let lastFrame = performance.now();
  */
 let lastPose: ReturnType<PlayScene['syncRacket']> | null = null;
 
+/**
+ * 发球辅助：地面上的发球区 + 拍面指向的落点圈。
+ *
+ * 只在**发球这一刻**显示（`setup` / `toss` / 球还没第一次落地）。相持中把地板
+ * 染一块绿会抢视觉，而发球恰恰是唯一「必须落进某个格子」的球，提示要给在这里。
+ *
+ * 落点圈红绿两色用的是和判定完全相同的 `serveAim()`：绿 = 球会落进正确的区，
+ * 红 = 会失误。所以玩家在**抛球之前**就能看到自己瞄对了没有——这是「必须发到
+ * 正确的区」这条规则唯一的可学习入口，没有它就只能靠反复失误去猜。
+ */
+function updateServeAid() {
+  const info = game.serveInfo;
+  const serving = game.phase === 'setup' || game.phase === 'toss' || game.servePending;
+  if (game.over || !serving) {
+    scene.setServeBox(null);
+    scene.setServeAim(null, false);
+    return;
+  }
+  scene.setServeBox(serveBox(info.server, info.court));
+
+  // 落点圈只画玩家自己发球：对手发球时玩家瞄的是「接发球」，画个圈反而误导。
+  if (info.server !== 'player' || !lastPose) {
+    scene.setServeAim(null, false);
+    return;
+  }
+  // 和 `Duel.launchServe` 用的是同一组输入（击球区中心 + 法线 + 拍柄），所以屏幕上
+  // 那圈就是球真正会落的地方——不是示意。`serveStrike` 把握点按锚点钳过，
+  // `serveAim` 内部再把双面拍翻正、必要时改用拍框当准星，两边完全同一条路。
+  const aim = serveAim(
+    serveStrike(lastPose),
+    vrot(lastPose.q, [0, 0, 1]),
+    info.server,
+    info.court,
+    vrot(lastPose.q, [0, 1, 0])
+  );
+  scene.setServeAim(aim.point, aim.inBox);
+}
+
 function loop() {
   const now = performance.now();
   const dt = Math.min((now - lastFrame) / 1000, 0.05);
@@ -827,10 +912,10 @@ function loop() {
   game.pushRacket(lastPose);
   // 对手的拍子画在它判定用的那个位姿上。顺序同样不能反：先定这一帧的位姿，
   // 再推进物理，最后渲染——否则屏幕上对手的拍子比判定晚一帧到位。
-  if (isDuel()) scene.syncOpponent((game as Duel).machinePose(now));
-
+  scene.syncOpponent(game.machinePose(now));
   for (const e of game.update(dt, now)) handle(e);
 
+  updateServeAid();
   scene.setBall(game.ball.p, game.ball.spin);
   scene.render(dt);
 
@@ -901,21 +986,21 @@ addEventListener('beforeunload', () => {
 });
 
 /**
- * 启动。由 `main.ts`（墙打）和 `duel-main.ts`（对打）各自调用一次。
+ * 启动。由 `main.ts` 调用一次。
  *
- * 两个页面各是一个独立的 vite 服务（:5173 / :5174），信令也各走各的——
- * 同一台机器上可以同时开两个浏览器窗口分别打两种模式，互不干扰。
+ * 没有参数：11-15 删掉对墙打之后只剩一种模式。曾经这里吃一个 `SceneMode`，
+ * 三个分支（场景 / 规则对象 / HUD 主数字）都要在那里分叉——现在都塌掉了。
  */
-export function startPlay(mode: SceneMode) {
-  scene = new PlayScene(canvas, { mode });
+export function startPlay() {
+  scene = new PlayScene(canvas);
   scene.setRigEnabled(rigOn);
-  game = mode === 'duel' ? new Duel(liveStroke) : new Rally(liveStroke);
+  game = new Duel(liveStroke);
 
-  document.title = mode === 'duel' ? '网球体感 P1 · 对打（脚本回球机）' : '网球体感 P1 · 对墙打';
+  document.title = '网球体感 P1 · 对打（脚本回球机）';
   const label = document.getElementById('s-label');
-  if (label) label.textContent = mode === 'duel' ? '比分' : '连拍';
+  if (label) label.textContent = '分';
   const subLabel = document.getElementById('s-sub-label');
-  if (subLabel) subLabel.textContent = mode === 'duel' ? '最长回合' : '最好';
+  if (subLabel) subLabel.textContent = '局';
 
   // 尺寸与 resize 监听在 PlayScene 的构造函数里就装好了，这里不要重复挂。
   void boot();

@@ -6,12 +6,12 @@
  * 内置的参数是 sim「中力」档一次真实的 reach 漏接（ tilt 18° 拍面），
  * 就是它钉出了「竖平面窗口对斜拍面是错的」这个 bug——换任何出球参数都能跑。
  *
- * 用法：node scripts/sim.mjs && node scripts/probe-scan2.cjs
- * （sim.mjs 负责把 core 编译成 .tmp-sim）
+ * 用法：npm run core && node scripts/probe-scan2.cjs
+ * （`npm run core` 负责把 core 编译成 .tmp-duel）
  */
-const { advance, makeBall } = require('../.tmp-sim/core/physics.js');
-const { sweepFace } = require('../.tmp-sim/core/racket.js');
-const court = require('../.tmp-sim/core/court.js');
+const { advance, makeBall } = require('../.tmp-duel/core/physics.js');
+const { sweepFace } = require('../.tmp-duel/core/racket.js');
+const court = require('../.tmp-duel/core/court.js');
 const { HIT_Z, NET_Z, BALL_R } = court;
 
 /* ---- 默认复刻那次失败出球；改这三个数就能扫描任意一拍 ---- */

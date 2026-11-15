@@ -5,8 +5,8 @@
  * 这里直接网格扫 (vy, vz)，打印落点位置和弹起后到拍面的高度，
  * 先看清楚物理上哪些组合是可行的、以及「下降期到达」需要多大的 d。
  */
-const { makeBall, advance } = require('../.tmp-sim/core/physics.js');
-const { HIT_Z, PHYS_DT } = require('../.tmp-sim/core/court.js');
+const { makeBall, advance } = require('../.tmp-duel/core/physics.js');
+const { HIT_Z, PHYS_DT } = require('../.tmp-duel/core/court.js');
 
 const Z0 = -11;
 const Y0 = 1.4;

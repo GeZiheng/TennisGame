@@ -3,15 +3,15 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-    <title>网球体感 P1 · 对墙打</title>
+    <title>网球体感 P1 · 对打（脚本回球机）</title>
     <link rel="stylesheet" href="/src/style.css" />
   </head>
   <body class="play-page">
     <canvas id="scene"></canvas>
 
     <div id="connect-panel" class="panel connect-panel">
-      <h1>用手机当球拍</h1>
-      <p class="hint">手机扫下面的码，或者手动输入地址。两台设备需要在同一个 Wi-Fi 下（建议 5GHz）。</p>
+      <h1>用手机当球拍 · 与回球机对打</h1>
+      <p class="hint">手机扫下面的码，或者手动输入地址。对面是一台脚本回球机——它靠你打过来的球自己跑位、自己回球，不会作弊加速。</p>
       <p id="proto-warn" class="proto-warn" hidden></p>
       <div class="qr-wrap">
         <canvas id="qr"></canvas>
@@ -29,11 +29,11 @@
 
     <div id="game-hud" class="game-hud" hidden>
       <div class="g-streak">
-        <span class="g-label" id="s-label">连拍</span>
+        <span class="g-label" id="s-label">分</span>
         <span id="s-streak" class="g-num">0</span>
       </div>
       <div class="g-sub">
-        <span><span id="s-sub-label">最好</span> <b id="s-best">0</b></span>
+        <span><span id="s-sub-label">局</span> <b id="s-best">0</b></span>
         <span class="g-dot">·</span>
         <span><b id="s-speed">—</b><em>km/h</em></span>
         <span class="g-dot">·</span>
@@ -70,9 +70,8 @@
     </div>
 
     <div class="hint-bar">
-      <kbd>WASD</kbd> 手动走位 · <kbd>F</kbd> 自动走位 · <kbd>拖动</kbd> 环视 · <kbd>Z</kbd> 近景/全景 ·
-      <kbd>G</kbd> 挥拍枢轴 · <kbd>M</kbd> 模拟控制器 · <kbd>X</kbd> 声音 · <kbd>C</kbd> 重新开始 ·
-      <kbd>R</kbd> 重置统计
+      <kbd>WASD</kbd> 手动走位 · <kbd>F</kbd> 自动走位 · <kbd>拖动</kbd> 环视 · <kbd>M</kbd> 模拟控制器 ·
+      <kbd>X</kbd> 声音 · <kbd>C</kbd> 重开一盘 · <kbd>R</kbd> 重置统计 · <b>发球时球自动抛起，等它落下再挥</b>
     </div>
 
     <script type="module" src="/src/play/main.ts"></script>

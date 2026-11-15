@@ -13,6 +13,7 @@
 
 import { vcross, vmul, vlen, vrot, clamp, type V3 } from './vec';
 import type { Quat } from './imu';
+import { frontFace } from './racket';
 import {
   SWING_ARM,
   SPEED_GAIN,
@@ -43,7 +44,7 @@ export interface Stroke {
   head: V3;
   /** 拍头速率 */
   speed: number;
-  /** 拍面法线（世界系，单位向量） */
+  /** 拍面法线（世界系，单位向量）。**已统一成朝球场的那一面**，见 `frontFace`。 */
   face: V3;
   /** 拍柄指向（世界系，单位向量） */
   grip: V3;
@@ -91,7 +92,7 @@ const CHARGE_FULL_W = 19;
  *
  * 结算本身也是有代价的——它必然发生在峰值之后，而球碰到拍面就在峰值附近。
  * 所以真正击球时不会等结算，而是用 peekLive() 直接取「进行中」的峰先打出去
- * （见 Rally 的 liveStroke 参数）。这个类只负责「什么时候算一拍」，
+ * （见 `Duel` 构造的 `liveStroke` 参数）。这个类只负责「什么时候算一拍」，
  * 不负责「什么时候该让球飞」。
  *
  * 不用积分、不做轨迹还原，是因为手机陀螺仪在挥拍峰值处经常被 2000°/s 量程削顶。
@@ -225,7 +226,10 @@ export class SwingDetector {
     // 所以这里不需要额外的坐标系转换矩阵。
     const omegaW = vrot(q, s.omega);
     const grip = vrot(q, [0, 1, 0]);
-    const face = vrot(q, [0, 0, 1]);
+    // 拍面是**双面**的：反手时手机翻了个面、设备法线指着身后，但物理上那是
+    // 一块完好的拍面。这里统一翻成朝球场那一面——下游（出球方向、发球瞄准）
+    // 就都不用再想这件事了。见 `racket.ts` 的 `frontFace`。
+    const face = frontFace(vrot(q, [0, 0, 1]));
 
     // 拍头速度 v = ω × r
     const head = vcross(omegaW, vmul(grip, SWING_ARM));
@@ -259,8 +263,9 @@ export class SwingDetector {
  *   - 挥得越快，球越快
  *   - 向上刷球 = 上旋，向下切 = 下旋
  *
- * 拍面几乎背对球场时判为失误，这不是 bug，是玩法：不转正拍面就打不出去，
- * 和真实网球一样。
+ * 拍面**侧着**（拿拍框去撞球）时判为失误，这不是 bug，是玩法：不转正拍面就打不出去，
+ * 和真实网球一样。正手 / 反手没有区别——拍子是双面的，法线朝后时这里会先翻成
+ * 「朝球场那一面」（`frontFace`），所以反手不再是另一套判据。
  */
 export interface Shot {
   v: V3;
@@ -279,10 +284,13 @@ const FORWARD: V3 = [0, 0, -1];
 const UP: V3 = [0, 1, 0];
 
 export function shotFromStroke(stroke: Stroke): Shot {
-  const face = stroke.face;
+  // 拍面是双面的。`Stroke.face` 从检测器出来时已经翻过（`buildStroke`），这里再翻
+  // 一次是**幂等**的——纯函数不该依赖调用方先归一化，单测和探针也就能直接喂原始法线。
+  const face = frontFace(stroke.face);
   const headDir = vlen(stroke.head) > 1e-6 ? unit(stroke.head) : FORWARD;
 
-  // 拍面朝向球场的程度。-1 表示完全背对，1 表示正对。
+  // 拍面朝向球场的程度：1 = 正对，0 = 拍框正对来球（90°，撞框）。
+  // `face` 已经翻成朝球场那一面，所以这里不会是负值——反手不再是另一套判据。
   const alignment = dot(face, FORWARD);
 
   // 出球方向 = 拍面法线为主，挥拍方向为辅。
@@ -295,8 +303,8 @@ export function shotFromStroke(stroke: Stroke): Shot {
   ];
   let dir = unit(mixed);
 
-  // 拍面完全背对（alignment 很负）时故意不改方向——让球照着拍面飞出去，
-  // 玩家会立刻看到「球往后飞了」，这比任何文字提示都直接。
+  // 撞框（拍面侧着）时故意不改方向——球照着拍面飞出去，玩家会立刻看到
+  // 「球往上/旁边飞了」，这比任何文字提示都直接。
   const clean = alignment > 0.15;
 
   // 球速：拍头速度沿出球方向的分量 + 一点基础速度。

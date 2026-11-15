@@ -1,7 +1,7 @@
 /**
  * 迭代验证流水线：把「改完必跑三件事」固化成一条命令。
  *
- *   node scripts/verify.mjs            # 全套：test ×3 → sim → build
+ *   node scripts/verify.mjs            # 全套：test ×3 → duel-sim → build
  *   node scripts/verify.mjs --fast     # 快检：test ×1 → build（pre-commit 用）
  *
  * 步骤一律通过 `npm run <script>` 调用，命令定义只存在于 package.json，
@@ -46,17 +46,17 @@ function probeHints() {
   const list = [...files];
   const hits = (...keys) => list.some((f) => keys.some((k) => f.includes(k)));
   const hints = [];
-  if (hits('physics', 'court', 'feed')) {
-    hints.push('  涉及喂球 / 弹道 → node scripts/probe-feed.cjs、node scripts/probe-feed-scan2.cjs');
+  if (hits('physics', 'court', 'serve')) {
+    hints.push('  涉及弹道 / 发球几何 → node scripts/probe-serve.cjs、node scripts/probe-serve2.cjs');
   }
-  if (hits('racket', 'swing', 'rally', 'swing-rig')) {
-    hints.push('  涉及挥拍 / 判定 → node scripts/probe-swing.cjs、node scripts/probe-geom.cjs');
+  if (hits('racket', 'swing')) {
+    hints.push('  涉及挥拍 / 拍面判定 → node scripts/probe-scan2.cjs；挥拍扫走拍面的缺口看 probe-contact');
   }
-  if (hits('auto-move', 'swing-rig', 'scene')) {
-    hints.push('  涉及走位 / 挥拍枢轴 → GRIP=horiz node scripts/probe-jitter.cjs（反向次数应为 0）、RIG=1 npm run sim');
+  if (hits('auto-move')) {
+    hints.push('  涉及走位 → GRIP=horiz node scripts/probe-jitter.cjs（反向次数应为 0）、node scripts/probe-contact.cjs（斜握 MODE=contact 的瞄准误差应 <0.05m）');
   }
-  if (hits('auto-move', 'rally')) {
-    hints.push('  涉及瞄准点 / 喂球 → node scripts/probe-contact.cjs 与 MODE=contact（瞄准误差应 <0.05m）');
+  if (hits('attitude', 'imu', 'protocol', 'gyro')) {
+    hints.push('  涉及姿态 / 网络 → node scripts/probe-pose.cjs');
   }
   return hints;
 }
@@ -65,12 +65,11 @@ const steps = FAST
   ? [['npm test', 'test', 1], ['npm run build', 'build', 1]]
   : [
       ['npm test', 'test', 3],
-      ['npm run sim', 'sim', 1],
       ['npm run duel-sim', 'duel-sim', 1],
       ['npm run build', 'build', 1],
     ];
 
-console.log(FAST ? '验证 · 快检（test ×1 → build）' : '验证 · 全套（test ×3 → sim → duel-sim → build）');
+console.log(FAST ? '验证 · 快检（test ×1 → build）' : '验证 · 全套（test ×3 → duel-sim → build）');
 
 for (const [label, script, times] of steps) {
   if (!run(label, script, times)) {
@@ -82,13 +81,13 @@ for (const [label, script, times] of steps) {
 console.log('\n✓ 验证通过');
 
 if (!FAST) {
-  // sim 刚跑完，.tmp-sim 的编译产物已就绪，probe 现在可以直接 require。
-  console.log('\nprobe 提示（.tmp-sim 产物已就绪，可直接跑）：');
+  // duel-sim 刚跑完，.tmp-duel 的编译产物已就绪，probe 现在可以直接 require。
+  console.log('\nprobe 提示（.tmp-duel 产物已就绪，可直接跑）：');
   const hints = probeHints();
   if (hints.length) {
     for (const h of hints) console.log(h);
   } else {
     console.log('  未检测到 core 改动；按改动类型自行选择。');
   }
-  console.log('  完整清单见 AGENTS.md 第 3 节（probe 依赖 .tmp-sim，必须排在 sim 之后）。');
+  console.log('  完整清单见 AGENTS.md 第 3 节（probe 依赖 .tmp-duel，必须排在 npm run core 之后）。');
 }
