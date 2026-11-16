@@ -85,8 +85,16 @@ export class ContactRecorder {
   private sessionSeq = 0;
   /** 上一次记录的相遇时刻，用来算 `sincePrevHit`（节奏是校准器的输入之一） */
   private lastAt: number | null = null;
-  /** 采集时的姿态漂移读数（度）。手机还没把读数回传上来，先留 null 占位 */
-  private readonly driftDeg: number | null = null;
+  /**
+   * 姿态漂移读数，手机端 1Hz 报文里的那份（`app.ts` 的 `onCtrl` 转发进来）。
+   *
+   * 语义随 `comp` 变：补偿关是「此刻歪了多少」，补偿开是「已经扣掉了多少」。
+   * 两个字段成对记进样本，理由见 `core/contact-log.ts` 的 `meta.driftDeg`。
+   *
+   * 初值 `deg: null` 表示**不知道**（还没收到报文 / 旧版手机页面），不是 0——
+   * 记成 0 会让「漂移超标整段剔除」这一步把可疑数据全放过。
+   */
+  private drift: { deg: number | null; comp: boolean } = { deg: null, comp: false };
 
   constructor(private readonly hooks: RecorderHooks) {
     this.runId = stamp();
@@ -124,7 +132,8 @@ export class ContactRecorder {
         capture: c,
         rally: snap.rally,
         sincePrevHit: this.lastAt === null ? null : c.t - this.lastAt,
-        driftDeg: this.driftDeg,
+        driftDeg: this.drift.deg,
+        driftComp: this.drift.comp,
         session: this.sessionName,
       })
     );
@@ -154,8 +163,21 @@ export class ContactRecorder {
     this.sessionSeq++;
     this.sessionName = `s${this.sessionSeq}`;
     this.lastAt = null;
+    // 漂移读数跟着换段失效：手机在 `R` / 重连时会把观测清零，下一段的第一条报文
+    // 到来之前，手里这个数是上一段的累计值，记进新样本就是错的。置空而不是置 0。
+    this.drift = { deg: null, comp: this.drift.comp };
     // 换段立刻落盘：`R` 之后立刻刷新页面是常见操作，别把上一段留在内存里
     void this.flush();
+  }
+
+  /**
+   * 手机端 1Hz 漂移报文（`app.ts` 的 `onCtrl` 转发）。
+   *
+   * 不做平滑、不插值：样本要的是「相遇那一刻的读数」，而漂移是慢变量，
+   * 1 秒的滞后远小于剔除门限。平滑反而会把握手瞬间的跳变糊掉。
+   */
+  setDrift(deg: number, comp: boolean) {
+    this.drift = { deg, comp };
   }
 
   /** `L`：暂停 / 恢复。暂停即落盘——暂停的意图多半是「这一轮打完了」。 */

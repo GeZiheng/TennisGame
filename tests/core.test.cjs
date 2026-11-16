@@ -18,7 +18,7 @@ const { serveBox, serveStandX, inServeBox, serveAim, serveStrike, tossContact, O
 const { BALL_R, HIT_Z, RACKET_POS, FACE_RX, FACE_RY, FACE_CY, NET_Z, NET_H, HALF_WIDTH, PHYS_DT, OPP_HIT_Z, OPP_BASELINE_Z, BASELINE_Z, GRAVITY } = require('./core/court.js');
 const { sweepFace, faceCovers, faceCenter, frontFace, RacketTrack, IDLE_POSE } = require('./core/racket.js');
 const { buildContactSample, lagBuckets, samplesToJsonl, summarizeContacts, usableForCalibration,
-  aimResidual, ContactLog } = require('./core/contact-log.js');
+  aimResidual, ContactLog, FEATURE_KEYS } = require('./core/contact-log.js');
 
 let pass = 0;
 const t = (name, fn) => {
@@ -258,30 +258,115 @@ t('万向锁回退分支必须能被识别', () => {
   assert.strictEqual(isYawGimbal(gimbalQ), true);
 });
 
-t('慢漂被积分、挥拍的大转角原样放过，且挥拍后继续积分', () => {
-  const o = new YawDriftObserver();
-  let q = deviceEulerToWorldQuat(0, 90, 0);
-  o.update(q);
-  for (let i = 1; i <= 30; i++) {
-    q = deviceEulerToWorldQuat(i * 0.4, 90, 0); // 每帧 +0.4°，慢漂
-    o.update(q);
+// 真机 `deviceorientation` 大多是 20–25Hz，这里统一按 50ms 一帧构造
+const DT_20HZ = 50;
+
+// 陀螺读数：静止时是噪声量级（远低于 STILL_GYRO_RATE = 0.04 rad/s ≈ 2.3°/s），
+// 挥拍中段实测 8 rad/s 量级。ZUPT 判据全靠这一个数，所以测试里必须显式给。
+const GYRO_STILL = 0.01;
+const GYRO_SWING = 8;
+
+/** 按恒定角速度推进若干帧：alpha 是「传感器看到的朝向」，gyro 是「手机转了多少」 */
+function driftFrames(o, degPerSec, ms, gyro = GYRO_STILL, from = 0) {
+  const n = Math.round(ms / DT_20HZ);
+  let alpha = from;
+  for (let i = 0; i < n; i++) {
+    alpha += (degPerSec * DT_20HZ) / 1000;
+    o.update(deviceEulerToWorldQuat(alpha, 90, 0), DT_20HZ, gyro);
   }
-  assert.ok(Math.abs(o.degrees - 12) < 0.1, `30 帧 ×0.4° 应累积 12°，实际 ${o.degrees.toFixed(2)}°`);
+  return alpha;
+}
 
-  q = deviceEulerToWorldQuat(12 + 25, 90, 0); // 单帧 25°，一次中等挥拍
-  o.update(q);
-  assert.ok(Math.abs(o.degrees - 12) < 0.1, `挥拍不该计入漂移，实际 ${o.degrees.toFixed(2)}°`);
+t('静止窗口里测零偏，运动帧按零偏外推', () => {
+  const o = new YawDriftObserver();
+  driftFrames(o, 1.5, 2000);
+  assert.ok(Math.abs(o.degrees - 3) < 0.1, `静止 2s × 1.5°/s 应积 3°，实际 ${o.degrees.toFixed(2)}°`);
+  assert.ok(o.biasDegPerSec !== null, '静置 2s 必须已经学到零偏');
+  assert.ok(Math.abs(o.biasDegPerSec - 1.5) < 0.15, `零偏应约 1.5°/s，实际 ${o.biasDegPerSec.toFixed(2)}°/s`);
+
+  const before = o.degrees;
+  driftFrames(o, 200, 1000, GYRO_SWING, 3);
+  assert.ok(Math.abs(o.degrees - before - 1.5) < 0.1,
+    `运动 1s 应按零偏外推 1.5°，实际涨了 ${(o.degrees - before).toFixed(2)}°`);
+});
+
+// 4.35 的回归测试：旧实现的棘轮——快挥出去被拒、慢回位被当成漂移吃掉，
+// 每拍往里走一截且永不回头。现在静止由陀螺判，回位那半根本不进估计。
+t('棘轮回归：快挥出去再慢回位，回位不能被吃成漂移', () => {
+  const o = new YawDriftObserver();
+  let a = driftFrames(o, 1.5, 2000); // 静置，学到 1.5°/s 的零偏
+  const before = o.degrees;
+  a = driftFrames(o, 400, 100, GYRO_SWING, a);   // 100ms 转 40°，一次快挥（真动作）
+  driftFrames(o, 4, 10000, 0.07, a);             // 4°/s 慢慢回位 10s，共 40°
+  const grew = o.degrees - before;
+  // 这 10 秒只该补 1.5°/s × 10s = 15°，那 40° 回位一度都不能进
+  assert.ok(Math.abs(grew - 15) < 1, `应只涨 15°（零偏外推），实际涨了 ${grew.toFixed(1)}°`);
+});
+
+t('慢速真实转动（4°/s）不会被学成零偏', () => {
+  const o = new YawDriftObserver();
+  driftFrames(o, 4, 3000, 0.07); // 陀螺 0.07 rad/s > 2.3°/s 门限 → 一直是「在动」
+  assert.strictEqual(o.biasDegPerSec, null, '没有合格静止窗口，不该凭空产生零偏');
+  assert.ok(Math.abs(o.degrees) < 1e-9, `运动中不该积分，实际 ${o.degrees.toFixed(2)}°`);
+});
+
+t('陀螺不可用（NaN）时一律按运动处理：不学零偏、也不吃真实转动', () => {
+  const o = new YawDriftObserver();
+  driftFrames(o, 1.5, 2000, NaN);
+  assert.strictEqual(o.degrees, 0, '拿不到陀螺就不能猜漂移');
+  assert.strictEqual(o.biasDegPerSec, null);
+  assert.ok(o.skippedSteps > 0);
+});
+
+// 4.34 的回归测试：门限必须按角速度判，不能按「每帧角度」判。
+// 旧代码是 0.05 rad/帧，20Hz 下等于 72°/s —— 拿着手机转身就被当成漂移积进去。
+t('有意转动（30°/s）在 20Hz 与 60Hz 下都不该被积分', () => {
+  for (const dt of [DT_20HZ, 1000 / 60]) {
+    const o = new YawDriftObserver();
+    const perFrame = 30 * (dt / 1000); // 30°/s 折算到每帧
+    const gyro = (30 * Math.PI) / 180; // 0.52 rad/s，远高于静止门限
+    let q = deviceEulerToWorldQuat(0, 90, 0);
+    o.update(q, dt, gyro);
+    for (let i = 1; i <= 60; i++) {
+      q = deviceEulerToWorldQuat(i * perFrame, 90, 0);
+      o.update(q, dt, gyro);
+    }
+    assert.ok(Math.abs(o.degrees) < 1e-9,
+      `${dt.toFixed(1)}ms 帧间隔下 30°/s 不该积分，实际 ${o.degrees.toFixed(2)}°`);
+    assert.strictEqual(o.skippedSteps, 60);
+  }
+});
+
+t('同一个物理慢漂在 20Hz 与 60Hz 下积分出同样的角度', () => {
+  const acc = [DT_20HZ, 1000 / 60].map((dt) => {
+    const o = new YawDriftObserver();
+    const perFrame = 1.5 * (dt / 1000); // 恒定 1.5°/s
+    let q = deviceEulerToWorldQuat(0, 90, 0);
+    o.update(q, dt, GYRO_STILL);
+    const n = Math.round(2000 / dt); // 都跑 2 秒
+    for (let i = 1; i <= n; i++) {
+      q = deviceEulerToWorldQuat(i * perFrame, 90, 0);
+      o.update(q, dt, GYRO_STILL);
+    }
+    return o.degrees;
+  });
+  assert.ok(Math.abs(acc[0] - acc[1]) < 0.05,
+    `两种采样率应积出同样角度，实际 ${acc[0].toFixed(2)}° vs ${acc[1].toFixed(2)}°`);
+  assert.ok(Math.abs(acc[0] - 3) < 0.05, `2s × 1.5°/s 应是 3°，实际 ${acc[0].toFixed(2)}°`);
+});
+
+t('采样断档（切后台回来）那一帧不积分', () => {
+  const o = new YawDriftObserver();
+  o.update(deviceEulerToWorldQuat(0, 90, 0), DT_20HZ, GYRO_STILL);
+  o.update(deviceEulerToWorldQuat(50, 90, 0), 3000, GYRO_STILL); // 断档 3 秒、转了 50°
+  assert.ok(Math.abs(o.degrees) < 1e-9, `断档帧不该积分，实际 ${o.degrees.toFixed(2)}°`);
   assert.strictEqual(o.skippedSteps, 1);
-
-  q = deviceEulerToWorldQuat(37 + 0.4, 90, 0);
-  o.update(q);
-  assert.ok(Math.abs(o.degrees - 12.4) < 0.1, `挥拍后应继续积分，实际 ${o.degrees.toFixed(2)}°`);
 });
 
 t('换握位的大跳变不会被当成漂移', () => {
   const o = new YawDriftObserver();
-  o.update(deviceEulerToWorldQuat(10, 90, 0));
-  o.update(deviceEulerToWorldQuat(10, 90, 90)); // 正手 ↔ 反手
+  o.update(deviceEulerToWorldQuat(10, 90, 0), DT_20HZ, GYRO_STILL);
+  o.update(deviceEulerToWorldQuat(10, 90, 90), DT_20HZ, GYRO_STILL); // 正手 ↔ 反手
   assert.ok(Math.abs(o.degrees) < 1e-9, `大跳变不该积分，实际 ${o.degrees}`);
   assert.strictEqual(o.skippedSteps, 1);
 });
@@ -293,10 +378,11 @@ t('把观测到的漂移扣进 yawZero 后，输出姿态回到启动那一刻',
 
   const o = new YawDriftObserver();
   let q = start;
-  o.update(q);
-  for (let i = 1; i <= 40; i++) {
-    q = deviceEulerToWorldQuat(10 + i * 0.5, 90, 0); // 一路慢漂 20°
-    o.update(q);
+  o.update(q, DT_20HZ, GYRO_STILL);
+  // 2°/s × 10s = 20°，20Hz 下每帧 0.1°
+  for (let i = 1; i <= 200; i++) {
+    q = deviceEulerToWorldQuat(10 + i * 0.1, 90, 0);
+    o.update(q, DT_20HZ, GYRO_STILL);
   }
   const raw = toOutputQuat(q, zero);
   const fixed = toOutputQuat(q, zero + o.radians);
@@ -306,17 +392,24 @@ t('把观测到的漂移扣进 yawZero 后，输出姿态回到启动那一刻',
   assert.ok(fixedErr < 0.5, `补偿后应回正，实际 ${fixedErr.toFixed(1)}°`);
 });
 
-t('reset 后观测归零（对应按 R / 新会话）', () => {
+t('resetAngle 保留零偏（按 R 重标定后不用重新站定）', () => {
   const o = new YawDriftObserver();
-  let q = deviceEulerToWorldQuat(0, 90, 0);
-  o.update(q);
-  for (let i = 1; i <= 30; i++) {
-    q = deviceEulerToWorldQuat(i * 0.4, 90, 0);
-    o.update(q);
-  }
+  driftFrames(o, 1.5, 2000);
+  const bias = o.biasDegPerSec;
+  assert.ok(bias !== null, '前提：已经学到零偏');
+  o.resetAngle();
+  assert.strictEqual(o.radians, 0);
+  assert.strictEqual(o.biasDegPerSec, bias, '重标定改的是正前方，不改陀螺零偏');
+});
+
+t('reset 后观测归零（新会话：连零偏一起清）', () => {
+  const o = new YawDriftObserver();
+  driftFrames(o, 1.5, 2000);
   assert.ok(Math.abs(o.degrees) > 1, '先要真的积到漂移');
+  assert.ok(o.biasDegPerSec !== null, '先要真的学到零偏');
   o.reset();
   assert.strictEqual(o.radians, 0);
+  assert.strictEqual(o.biasDegPerSec, null);
   assert.strictEqual(o.skippedSteps, 0);
 });
 
@@ -385,18 +478,20 @@ t('reset 后回到「第一帧无条件采信」', () => {
 
 t('非 Y 轴的微小俯仰不算偏航漂移（避免补偿随机游走）', () => {
   const o = new YawDriftObserver();
-  o.update(deviceEulerToWorldQuat(30, 60, 0));
-  o.update(deviceEulerToWorldQuat(30, 61.5, 0)); // 纯俯仰 1.5°，投影到 Y 上很小
+  o.update(deviceEulerToWorldQuat(30, 60, 0), DT_20HZ, GYRO_STILL);
+  o.update(deviceEulerToWorldQuat(30, 61.5, 0), DT_20HZ, GYRO_STILL); // 纯俯仰 1.5°，投影到 Y 上很小
   assert.ok(Math.abs(o.degrees) < 0.01, `俯仰不该进漂移累积，实际 ${o.degrees.toFixed(3)}°`);
-  assert.strictEqual(o.skippedSteps, 1);
 });
 
 t('纯 yaw 慢漂仍被完整积分（纯度判据不能误伤）', () => {
   const o = new YawDriftObserver();
-  let q = deviceEulerToWorldQuat(0, 90, 0);
-  o.update(q);
-  for (let i = 1; i <= 30; i++) o.update(deviceEulerToWorldQuat(i * 0.4, 90, 0));
-  assert.ok(Math.abs(o.degrees - 12) < 0.1, `应累积 12°，实际 ${o.degrees.toFixed(2)}°`);
+  o.update(deviceEulerToWorldQuat(0, 90, 0), DT_20HZ, GYRO_STILL);
+  // 1.5°/s = 20Hz 下每帧 0.075°；这是「纯 yaw」，不该被 off-axis 判据拦下
+  for (let i = 1; i <= 40; i++) {
+    o.update(deviceEulerToWorldQuat(i * 0.075, 90, 0), DT_20HZ, GYRO_STILL);
+  }
+  assert.ok(Math.abs(o.degrees - 3) < 0.1, `应累积 3°，实际 ${o.degrees.toFixed(2)}°`);
+  assert.strictEqual(o.skippedSteps, 0);
 });
 
 console.log('统计');
@@ -2158,6 +2253,43 @@ t('样本记下相遇前的瞄准点与走位容差，且必须是快照', () =>
     '走位容差与瞄准点只能进 meta');
 });
 
+t('feat 与白名单逐字一致：at 会被走位泄漏，只能待在 meta 里', () => {
+  const s = mkSample(10, 0.1);
+
+  // 白名单是「建模时 X 只准取这些」的唯一一处定义。这条断言把它和实际输出钉在一起：
+  // 以后谁往 feat 里加字段而没登记，或者把 meta 的东西挪回 feat，都会红。
+  assert.deepStrictEqual(Object.keys(s.feat).sort(), [...FEATURE_KEYS].sort());
+  for (const k of FEATURE_KEYS) assert.ok(k in s.feat, `白名单里的 ${k} 没被写出来`);
+
+  // `at` 记的是球的世界坐标，而球是打到身边才打得到的——实测与 `label.G` 的 x 分量
+  // 相关 0.994、|at − G| 均值 0.565m。喂进模型等于把握点（走位输出）塞回 X。
+  assert.ok(!('at' in s.feat), 'at 不能进特征');
+  // 但诊断还要用它还原漏接几何，所以不能删
+  assert.deepStrictEqual(s.meta.at, [0.1, 1.9, 0.3]);
+});
+
+t('driftDeg 与 driftComp 成对记录，缺省按「没补偿」处理', () => {
+  const mk = (extra) => buildContactSample({
+    t: 0, grip: [0, 1.3, 0.3], rest: [0, 0.6, 0], planOffset: [0, 0.6, 0],
+    holdR: 0.14, deadband: 0.05, deadbandY: 0.02,
+    capture: { t: 0, fc: [0.1, 1.9, 0.3], at: [0.1, 1.9, 0.3], ballV: [0, 0, 10],
+      hit: true, offCenter: 0.2, lag: 10, stroke: null, serve: false },
+    rally: 1, sincePrevHit: null, session: 's1', ...extra,
+  });
+
+  // 手机没接上 / 旧版页面没发报文：只能是 null（不知道）。记成 0 会让
+  // 「漂移超标整段剔除」把可疑样本全放过。
+  const unknown = mk({ driftDeg: null });
+  assert.strictEqual(unknown.meta.driftDeg, null);
+  assert.strictEqual(unknown.meta.driftComp, false);
+
+  // 补偿开时 `driftDeg` 是「已经扣掉了多少」，关时是「此刻歪了多少」——同一个数
+  // 两种含义，必须成对记才能解释。
+  const on = mk({ driftDeg: 12.5, driftComp: true });
+  assert.strictEqual(on.meta.driftDeg, 12.5);
+  assert.strictEqual(on.meta.driftComp, true);
+});
+
 t('瞄准残差 = 拍面中心偏离瞄准点，且正好等于 fc − p', () => {
   // G = p − planOffset，所以 p = G + planOffset；残差应当逐分量等于 fc − p
   const G = [0, 1.3, 0.3];
@@ -2194,6 +2326,8 @@ t('JSONL：一行一条、分组齐全、空集合给空串', () => {
   assert.strictEqual(row.label.rest[1], 0.6, 'label 和 feat 的 rest 应是同一份快照');
   assert.ok('planOffset' in row.meta && 'holdR' in row.meta && 'deadband' in row.meta
     && 'deadbandY' in row.meta, 'meta 应带上瞄准点与走位容差');
+  assert.ok('driftDeg' in row.meta && 'driftComp' in row.meta,
+    'meta 应带上漂移读数与其补偿状态');
 });
 
 t('分组读数把「命中」和「没碰到」分开列', () => {

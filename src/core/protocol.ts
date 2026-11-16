@@ -99,4 +99,14 @@ export type CtrlMsg =
   | { t: 'ping'; t0: number }
   | { t: 'pong'; t0: number; t1: number; t2: number }
   | { t: 'recal' }
-  | { t: 'recal-ack'; at: number };
+  | { t: 'recal-ack'; at: number }
+  /**
+   * 姿态漂移读数，手机端 1Hz 上报。
+   *
+   * 走 ctrl 而不是塞进定长包：它是每秒变零点几度的慢变量，掺进 60Hz 的二进制包里
+   * 要改 `PACKET_BYTES`、还得再留一个兼容分支，收益只是省几条 40 字节的 JSON。
+   *
+   * `deg` 的语义随 `comp` 变——补偿关是「此刻歪了多少」，补偿开是「已经扣掉了
+   * 多少」。采集样本里两个字段必须成对记，否则这个数没法解释（`contact-log.ts`）。
+   */
+  | { t: 'drift'; deg: number; comp: boolean };

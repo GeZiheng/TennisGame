@@ -13,10 +13,19 @@
  *   它必须记（否则算不出 `delta`），但**绝对不能进特征**——进了就是闭环自激，
  *   模型会开始拟合自己的输出。
  * - `feat`：只放**与走位无关的外部条件**（握法、挥拍、来球）。这是模型能吃的 X。
+ *   白名单是 `FEATURE_KEYS`，测试拿它和实际输出对表——加字段没登记就会红。
  * - `meta`：命中与否、第几拍、漂移读数。用于筛选和整段剔除，不进 X。
  *
  * 三块分开写在文件结构里，是为了让「建模时只准 `feat` 进 X」这条约束看得见，
  * 而不是靠记性。
+ *
+ * ## `at` 曾经在 `feat` 里，11-16 挪进了 `meta`
+ *
+ * 它记的是「球在哪」，听起来是纯外部条件。但它存的是**世界坐标**，而球是打到
+ * 你身边才打得到的——`at` 和 `G` 的 x 分量相关系数 **0.994**，两者平均只差
+ * 0.565m 且差值近乎常数。也就是说 `at` 就是走位输出的另一个名字，进特征属于
+ * 闭环自激：模型的输入里含着自己的输出，离线 CV 会去拟合「上一版校准器留下的
+ * 系统性痕迹」，而那个东西一改校准器就变。改成 `at − G` 救不了，它同样含 `G`。
  *
  * ## 标签是「两个方向的差」，不是「到球的距离」
  *
@@ -133,8 +142,6 @@ export interface ContactSample {
     charge: number | null;
     /** 拍面法线。正反手的判据在里面——反手时手机翻面，`face[2]` 反号 */
     face: V3 | null;
-    /** 来球在相遇点的位置（横向 / 高度） */
-    at: V3;
     /** 来球速度（模长 + 入射角） */
     ballV: V3;
   };
@@ -154,8 +161,33 @@ export interface ContactSample {
     rally: number;
     /** 距上一次击球的毫秒数 */
     sincePrevHit: number | null;
-    /** 采集时的姿态漂移读数（度）。超阈值的整段丢弃，见 `AGENTS.md` 0.4 */
+    /**
+     * 采集时手机对「传感器已经漂了多少度」的估计（度）。
+     *
+     * **它不是误差，别按绝对值筛样本。** 4.35 改成 ZUPT 之后这个数等于
+     * `零偏 × 时间`，随玩法时长单调增长：打十分钟就是几百上千度，而数越大只说明
+     * 补偿做得越久。任何 `|driftDeg| > X` 的剔除阈值都会把正常的长会话整段砍掉。
+     * 判断「这段姿态可不可信」要看手机 HUD 上的零偏（°/s），不是这个累计量。
+     *
+     * 语义还分两种，**必须配合 `driftComp` 读**：补偿关时是「观测到的累计漂移」，
+     * 补偿开时是「已经替你扣掉多少」。同一个数在两个状态下的含义不同，混在一起
+     * 算平均会得出没有意义的结论。
+     *
+     * 读数是**相遇前最后一个 1Hz 报文**，最多滞后 1 秒（`CtrlMsg` 的 `drift`）。
+     * 手机没接上 / 旧版页面时为 null，表示「不知道」——**不是 0**。
+     */
     driftDeg: number | null;
+    /** 上面那个读数是在补偿开的状态下取的。见 `driftDeg`。 */
+    driftComp: boolean;
+    /**
+     * 球心位置（世界坐标）：碰到拍面时是接触点，没碰到时是最近点。
+     *
+     * **诊断用，禁止进特征。** 它曾经在 `feat` 里，11-16 挪出来：世界坐标的 `at`
+     * 与 `G` 的 x 分量相关 0.994、`|at − G|` 均值 0.565m，等于把握点（走位输出）
+     * 换个名字塞回了 X，见文件头。留着是因为：漏接的几何、`offCenter` 的来龙去脉、
+     * 以及「这一拍为什么够不着」都要靠它还原，只是不能喂给模型。
+     */
+    at: V3;
     /**
      * 相遇那一刻喂给 `planAutoMove` 的瞄准点（`restOffset + contactDelta`）。
      *
@@ -187,6 +219,15 @@ export interface ContactSample {
   };
 }
 
+/**
+ * `feat` 的字段白名单，**建模时 X 只准取这些**。
+ *
+ * 写在这里而不是写在注释里：测试拿它和 `buildContactSample` 的实际输出逐字对表，
+ * 谁往 `feat` 里加字段而没在这里登记，`npm test` 立刻红。`at` 不在这张表里——
+ * 它和 `G` 相关 0.994，见文件头。
+ */
+export const FEATURE_KEYS = ['rest', 'lag', 'peakW', 'speed', 'charge', 'face', 'ballV'] as const;
+
 /** 组装一条样本的外部输入。`grip` 是走位输出，只进 `label`。 */
 export interface ContactSampleInput {
   t: number;
@@ -203,6 +244,8 @@ export interface ContactSampleInput {
   rally: number;
   sincePrevHit: number | null;
   driftDeg: number | null;
+  /** 取上面那个读数时补偿是否开着。缺省按关处理（老调用方没有这一位） */
+  driftComp?: boolean;
   session: string;
 }
 
@@ -240,7 +283,6 @@ export function buildContactSample(input: ContactSampleInput): ContactSample {
       speed: c.stroke ? c.stroke.speed : null,
       charge: c.stroke ? c.stroke.charge : null,
       face: c.stroke ? cp(c.stroke.face) : null,
-      at: cp(c.at),
       ballV: cp(c.ballV),
     },
     meta: {
@@ -251,6 +293,8 @@ export function buildContactSample(input: ContactSampleInput): ContactSample {
       rally: input.rally,
       sincePrevHit: input.sincePrevHit,
       driftDeg: input.driftDeg,
+      driftComp: input.driftComp === true,
+      at: cp(c.at),
       planOffset: cp(input.planOffset),
       holdR: input.holdR,
       deadband: input.deadband,

@@ -180,6 +180,10 @@ function onPacket(pkt: ReturnType<typeof decodePacket>) {
 function onCtrl(msg: CtrlMsg) {
   if (msg.t === 'pong') {
     session.clock.ingest(msg.t0, msg.t1, msg.t2, performance.now());
+  } else if (msg.t === 'drift') {
+    // 采集用的姿态漂移读数。放在 recorder 而不是 session 里：它是采集侧的
+    // 外部输入，唯一消费方也是采集（`meta.driftDeg`），session 用不到。
+    recorder.setDrift(msg.deg, msg.comp);
   }
 }
 

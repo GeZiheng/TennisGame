@@ -91,8 +91,8 @@ export function toOutputQuat(absolute: Quat, yawZero: number): Quat {
  * 附近会换解分支，相减会凭空造出上百度假跳变。手机静止时 beta / gamma 不变，
  * `absolute = Ry(α)·K`，于是 `dq = Ry(Δα)` 严格成立，这里读出的就是 alpha 的漂移量。
  *
- * 非静止帧它只是「投影到世界 Y 的分量」，不是完整的欧拉角差；但那些帧根本不参与
- * 积分（见 YawDriftObserver），近似误差不会进入结果。
+ * 非静止帧它只是「投影到世界 Y 的分量」，不是完整的欧拉角差；而那些帧不参与零偏
+ * 测量（见 `YawDriftObserver`），近似误差不会进入估计。
  */
 function worldDeltaQuat(prev: Quat, next: Quat): Quat {
   let dq = qmul(qnorm(next), qconj(qnorm(prev)));
@@ -113,28 +113,87 @@ export function isYawGimbal(q: Quat): boolean {
 }
 
 /**
- * 相邻两帧绕世界 Y 的转角超过它，就认为是玩家真的在挥拍 / 换握，不积分。
+ * 陀螺认为「手机没在动」的角速度上限（rad/s，≈2.3°/s）。
  *
- * 真机慢漂约 1–2°/s，30–60Hz 采样下每帧不到 0.1°；一次中等挥拍中段角速度可达
- * 20 rad/s，相邻帧增量是十几到几十度。两者差两个数量级，门限很安全。
- * 用幅度而不是「静止门控」：挥拍那几百毫秒里 alpha 一样在漂，只积分静止帧会漏掉。
+ * **静止与否由陀螺判，不由 alpha 自己判——这是整套判据的唯一依据。** 旧版拿 alpha
+ * 的变化率当门限，于是同一个挥手动作「快的那半被拒、慢的那半被积」：一拍快挥出去
+ * 40°、四秒慢慢回位 4°/s，回位那半被判据当成漂移扣掉，每拍往里走一截且永不回头，
+ * 方向正是「回位的那一侧」（正手随挥收在身体左侧 = 反手位）。见 `docs/history.md` 4.35。
+ *
+ * 陀螺不漂（零偏 0.01–0.05 rad/s，量级随机），所以「陀螺说没动」可信。门限 2.3°/s：
+ * 手持准备姿势的手抖在 1–3°/s 附近，能过一部分；有意转身、走位调整 ≥10°/s 一律挡住。
  */
-const MAX_DRIFT_STEP = 0.05; // rad ≈ 2.9°/帧
+const STILL_GYRO_RATE = 0.04;
 /**
- * 增量四元数里 x / z 分量的上限（≈1.1° 的非 Y 轴旋转）。
+ * 连续静止多久才能**更新**已有零偏（毫秒）。
  *
- * 纯 alpha 慢漂的 dq 是 [0, sin(Δα/2), 0, cos(Δα/2)]，x/z 严格为 0。手机俯仰、
- * 横滚（挥拍起收势、换握、手抖）会让 x/z 明显非零，此时 dq 的 Y 投影只是
- * 「耦合出来的分量」，不是漂移。把它积分进 acc 会让 effZero 变成随机游走，
- * 补偿开启时表现就是拍子慢慢乱晃。
+ * 只用它做「细调」：短窗口噪声大，所以权重按窗口长度算（见 `update`），400ms 的
+ * 窗口只占 17%。
  */
-const MAX_DRIFT_OFF_AXIS = 0.01;
+const STILL_HOLD_MS = 400;
+/**
+ * **第一次**拿到零偏需要的连续静止时长（毫秒）。
+ *
+ * 比 `STILL_HOLD_MS` 严格得多，因为这一次的估计会直接被拿去外推：静止 1.2s 的
+ * 端点差噪声约 0.05°/s，而 0.4s 的窗口能到 0.2°/s——后者在十分钟的运动里会积出
+ * 上百度。宁可开局多站一会儿，也不能拿一个噪声当零偏。
+ */
+const BIAS_TRUST_MS = 1200;
+/**
+ * 零偏 EMA 的等效时间常数（毫秒）。
+ *
+ * 权重还按窗口长度加权（见 `update`）：停下十秒算出来的零偏，不该被下一段半秒的
+ * 抖动改掉；反过来 0.4s 的窗口只占 17%，噪声进不来。
+ */
+const BIAS_TAU_MS = 2000;
+/**
+ * 零偏的物理上限（rad/s，≈5.7°/s）。
+ *
+ * 磁力计被降权时 yaw 退化成纯陀螺积分，真机零偏 0.5–2°/s，个别机型能到 3–4°/s。
+ * 超过这个数基本是判据出错（把慢速真实转动当成静止），夹住它——宁可少补，不能让
+ * 补偿量线性跑飞。
+ */
+const MAX_BIAS_RATE = 0.1;
+/**
+ * 静止帧里 alpha 变化速率的合理上限（rad/s，≈5.7°/s）。
+ *
+ * 已经用陀螺判过静止了，这一条只兜「静止时 alpha 却跳了」：万向锁换解分支的瞬跳、
+ * 系统融合突然重收敛。那种跳变不能当漂移积分进去。
+ */
+const MAX_STILL_RATE = 0.1;
+/**
+ * 静止帧里非 Y 轴分量的角速度上限（rad/s，≈11.5°/s）。
+ *
+ * 纯 alpha 慢漂的 dq 是 [0, sin(Δα/2), 0, cos(Δα/2)]，x/z 严格为 0。俯仰 / 横滚
+ * 会让 x/z 明显非零，此时 dq 的 Y 投影只是耦合出来的分量，不是漂移。
+ */
+const MAX_STILL_OFF_RATE = 0.2;
+/**
+ * 两帧间隔超过它就当作「中间有一段没采到」：这一帧不参与，静止窗口也作废。
+ *
+ * 切后台 / 锁屏回来时首帧的角差跨了几秒钟的未知运动，按它算速率没有意义。
+ */
+const MAX_DRIFT_GAP_MS = 250;
+/** 帧间隔下限，避免除以接近 0 的 dt 把任意噪声都判成高速。 */
+const MIN_DRIFT_DT_MS = 4;
 
 /**
- * 只读漂移观测器：累积「慢变」的绕 Y 转角，快变（真实挥拍 / 换握）原样放过。
+ * 只读漂移观测器：**在静止窗口里测零偏，运动中按零偏外推**（ZUPT）。
  *
- * `deviceorientation` 的 alpha 会因室内磁场 / 系统融合重收敛慢慢走掉，而 beta /
- * gamma 有重力参考、不漂。把这个慢变量积分出来扣掉即可。
+ * 旧实现是「按角速度门限积分慢转角」：只要这一帧 alpha 变得够慢就当漂移积进去。
+ * 问题在于这个门限对真实动作是双向的——快挥被拒、慢回位被吃，于是每拍往里走一截
+ * （棘轮），方向恒为「回位的那一侧」。真机表现就是「打着打着拍子往反手转」。
+ *
+ * 现在两条路彻底分开：
+ *
+ *   - **静止帧**（陀螺 < `STILL_GYRO_RATE`、且 alpha 变化也小）：`acc += dy`。这是实测，
+ *     顺手喂零偏估计；
+ *   - **运动帧**：`acc += bias * dt`，拿最近测到的零偏外推。
+ *
+ * 真实动作一帧都进不了估计，所以**结构上不可能有棘轮**。代价两条：挥拍那几百毫秒
+ * 靠常数外推（误差 < 0.1°）；长时间运动里零偏若估错会线性累积——`MAX_BIAS_RATE`
+ * 夹住量级，下一次静止把零偏拉回来，但**已经积进 `acc` 的部分不会自动回退**，
+ * 这是模型的边界，不是 bug。
  *
  * 它只回答「传感器多转了多少」，**不定义正前方、不改 yawZero 的语义**。旧的
  * `recal` 把「当前朝向」重锁成正前方，才会只在反手位回得正、正手位锁错方向。
@@ -142,7 +201,13 @@ const MAX_DRIFT_OFF_AXIS = 0.01;
 export class YawDriftObserver {
   private prev: Quat | null = null;
   private acc = 0;
-  /** 被判为真实动作或非纯 Y 旋转而跳过的帧数，可用来看补偿有没有误吃挥拍 */
+  /** 零偏估计（rad/s）。`null` = 还没遇到合格的静止窗口，此时运动帧不补偿 */
+  private bias: number | null = null;
+  /** 当前静止窗口：长度、alpha 累计转角、时间累计（用来算零偏） */
+  private stillMs = 0;
+  private stillDy = 0;
+  private stillDt = 0;
+  /** 未按测量积分的帧数（运动 / 断档 / 跳变），用来看判据有没有乱吃 */
   private skipped = 0;
 
   get radians() {
@@ -153,26 +218,94 @@ export class YawDriftObserver {
     return (this.acc * 180) / Math.PI;
   }
 
+  /** 零偏（rad/s）。`null` 表示还没测到——此时运动帧不补偿，宁可不补也不能跑飞。 */
+  get biasRate(): number | null {
+    return this.bias;
+  }
+
+  get biasDegPerSec(): number | null {
+    return this.bias === null ? null : (this.bias * 180) / Math.PI;
+  }
+
   get skippedSteps() {
     return this.skipped;
   }
 
-  update(abs: Quat): number {
-    if (this.prev) {
-      const dq = worldDeltaQuat(this.prev, abs);
-      const dy = 2 * Math.atan2(dq[1], dq[3]);
-      const off = Math.hypot(dq[0], dq[2]);
-      if (Math.abs(dy) < MAX_DRIFT_STEP && off < MAX_DRIFT_OFF_AXIS) this.acc += dy;
-      else this.skipped++;
-    }
+  /**
+   * @param dtMs 与上一帧的间隔（毫秒）。**必填**：漏传就等于按采样率绑阈值。
+   * @param gyroRate 这一帧的角速度模长（rad/s）。**必填**，它才是「有没有在动」的
+   *   依据。传 `NaN` 表示这条通道当时不可用（`gyroSource === 'none'`）——一律按
+   *   运动处理：拿不到陀螺就不能判断真假，乱判会把真实动作吃成漂移。
+   */
+  update(abs: Quat, dtMs: number, gyroRate: number): number {
+    const prev = this.prev;
     this.prev = abs;
+    if (!prev) return this.acc;
+    if (!(dtMs > 0) || dtMs > MAX_DRIFT_GAP_MS) {
+      this.skipped++;
+      this.clearStill();
+      return this.acc;
+    }
+    const dt = Math.max(dtMs, MIN_DRIFT_DT_MS) / 1000;
+    const dq = worldDeltaQuat(prev, abs);
+    const dy = 2 * Math.atan2(dq[1], dq[3]);
+    const off = Math.hypot(dq[0], dq[2]);
+
+    const still =
+      Number.isFinite(gyroRate) &&
+      gyroRate < STILL_GYRO_RATE &&
+      Math.abs(dy) / dt < MAX_STILL_RATE &&
+      off / dt < MAX_STILL_OFF_RATE;
+
+    if (!still) {
+      this.skipped++;
+      this.clearStill();
+      if (this.bias !== null) this.acc += this.bias * dt;
+      return this.acc;
+    }
+
+    this.acc += dy;
+    this.stillMs += dtMs;
+    this.stillDy += dy;
+    this.stillDt += dt;
+    // 第一次要有足够长的窗口才认（`BIAS_TRUST_MS`），之后按窗口长度加权细调。
+    // 注意第一次之后**仍在同一个窗口里继续刷新**：`rate` 是整个窗口的均值，窗口越
+    // 长越准，所以要一直用到底，而不是在刚过门槛那一帧就冻结。
+    if (this.bias === null ? this.stillMs >= BIAS_TRUST_MS : this.stillMs >= STILL_HOLD_MS) {
+      const rate = this.stillDy / this.stillDt;
+      const next =
+        this.bias === null
+          ? rate
+          : this.bias + (rate - this.bias) * (this.stillMs / (this.stillMs + BIAS_TAU_MS));
+      this.bias = Math.max(-MAX_BIAS_RATE, Math.min(MAX_BIAS_RATE, next));
+    }
     return this.acc;
   }
 
-  reset() {
+  private clearStill() {
+    this.stillMs = 0;
+    this.stillDy = 0;
+    this.stillDt = 0;
+  }
+
+  /**
+   * 只清累计转角，**保留零偏**。
+   *
+   * 按 `R` 重标定、切换补偿开关都是这一类：`yawZero` 把已经扣掉的量吸收了，累加
+   * 要重新从 0 起；但零偏是陀螺的物理属性，和「正前方指哪」无关，丢了就得重新站
+   * 1.2 秒才补得回来。重连同理（`yawZero` 不重锁，观测本来就连续）。
+   */
+  resetAngle() {
     this.prev = null;
     this.acc = 0;
+    this.clearStill();
     this.skipped = 0;
+  }
+
+  /** 整段重来（新会话）：连零偏一起清。 */
+  reset() {
+    this.resetAngle();
+    this.bias = null;
   }
 }
 

@@ -39,7 +39,7 @@ src/controller/      手机端：sensors（双通道角速度）、env（环境�
                      axes（三分量示意）、main（姿态流水线 + 发送循环）
 server/              Vite 插件 + 信令房间 + /__lanip + /ca.crt
 scripts/             证书、单测跑手、端到端模拟、probe-* 诊断工具
-tests/core.test.cjs  158 项 / 26 分组（见 docs/testing.md）
+tests/core.test.cjs  167 项 / 26 分组（见 docs/testing.md）
 ```
 
 ---

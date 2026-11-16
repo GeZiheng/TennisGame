@@ -59,11 +59,37 @@ driftToggleEl.addEventListener('click', () => {
     if (yawZero !== null) yawZero += drift.radians;
   }
   driftOn = !driftOn;
-  // 关 → 开也要清观测：之前累积的是没被补偿的漂移，一次性扣进去会跳一下
-  drift.reset();
+  // 关 → 开也要清观测：之前累积的是没被补偿的漂移，一次性扣进去会跳一下。
+  // 用 `resetAngle` 保留零偏——它是陀螺的物理属性，和 `yawZero` 无关，丢了就得
+  // 重新站 1.2 秒才补得回来。
+  drift.resetAngle();
   driftToggleEl.textContent = driftOn ? '漂移补偿已开' : '漂移补偿已关';
   driftToggleEl.className = `rate ${driftOn ? 'good' : ''}`;
+  reportDrift();
 });
+
+/**
+ * 把当前漂移读数发给大屏（进样本的 `meta.driftDeg`）。
+ *
+ * 除了 1Hz 定时上报，**每次 `reset()` 之后都要立刻补报一次**：大屏换段（重连 / 按 R）
+ * 会把本地那份读数置空，等下一个 tick 就有最多 1 秒的空窗，而那正好落在新一段的头
+ * 几拍上——反倒是这几拍最需要知道「此刻歪了多少」。
+ */
+function reportDrift() {
+  link?.sendCtrl({ t: 'drift', deg: drift.degrees, comp: driftOn });
+}
+
+/**
+ * 这一帧的角速度模长（rad/s），用来判「手机有没有在动」。
+ *
+ * 通道不可用时返回 `NaN` 而不是 0：`currentGyro()` 在两条通道都断时给的是
+ * `[0,0,0]`，那和「真的静止」长得一模一样。观测器把 `NaN` 当运动处理，于是陀螺
+ * 断线期间既不学零偏也不补偿——没有参照就不猜，比猜错强。
+ */
+function gyroRate(): number {
+  if (source.gyroSource === 'none') return NaN;
+  return Math.hypot(lastGyro[0], lastGyro[1], lastGyro[2]);
+}
 
 const source: SampleSource = demo ? new DemoSource() : new MotionSource();
 const tracker = new ImuTracker();
@@ -91,6 +117,9 @@ let trackerAtBase: Quat | null = null; // 那一刻的陀螺积分快照
 let poseMode: 'absolute' | 'extrap' | 'gyro' = 'gyro';
 let currentQ: Quat = [...IDENTITY];
 let lastPoseAt = 0;
+/** 上一次喂给漂移观测器的那帧绝对姿态（同一帧只喂一次，见 `advancePose`） */
+let lastDriftAbs: Quat | null = null;
+let lastDriftAt = 0;
 
 let seq = 0;
 let peakG = 0;
@@ -175,7 +204,18 @@ function advancePose(dtMs: number) {
 
   if (abs && fresh) {
     gimbal = isYawGimbal(abs);
-    drift.update(abs);
+    // **只在新的一帧绝对姿态上推进观测器。** `advancePose` 会被 60Hz 发包循环叫到，
+    // 而方向事件只有 20–35Hz：同一帧重复喂进去，会让「50ms 的变化 ÷ 16.7ms 的 dt」
+    // 把速率放大三倍——静止帧被误判成运动、静止窗口一直被打断，零偏就永远学不到。
+    // 用「两次姿态更新之间」的墙钟间隔，才是这条判据要的 dt。
+    if (abs !== lastDriftAbs) {
+      const poseDt = lastDriftAt > 0 ? at - lastDriftAt : elapsed;
+      lastDriftAbs = abs;
+      lastDriftAt = at;
+      // 三个参数都必须给：「陀螺说没在动」才是静止的唯一依据（ZUPT，见 4.35）；
+      // 陀螺通道不可用时传 NaN，一律按运动处理，不然真实动作会被当成漂移吃掉。
+      drift.update(abs, poseDt, gyroRate());
+    }
   }
 
   // 只扣「传感器多转的量」，不重新定义正前方，因此与正手 / 反手握位无关。
@@ -299,10 +339,19 @@ function startUiLoop() {
     poseSrcEl.textContent = label;
     poseSrcEl.className = `rate ${poseMode === 'absolute' ? 'good' : 'warn'}`;
 
+    // 读数含义变了（4.35）：`d` 是「已经替你扣掉多少度」，随玩法时长单调增长，
+    // 不再是「传感器歪了多少」——所以不能再用 |d| 报警，那会在 15 秒后永久变橙。
+    // 真正该看的是零偏（每秒漂几度）：没测到说明还没遇到静止窗口；>2°/s 是真异常。
     const d = drift.degrees;
+    const bias = drift.biasDegPerSec;
+    const biasTxt = bias === null ? ' 待静止' : ` ${bias >= 0 ? '+' : ''}${bias.toFixed(1)}°/s`;
     driftToggleEl.textContent =
-      `漂移 ${d >= 0 ? '+' : ''}${d.toFixed(1)}°${driftOn ? ' · 补偿开' : ''}${gimbal ? ' · 万向锁' : ''}`;
-    driftToggleEl.className = `rate ${driftOn ? 'good' : Math.abs(d) > 20 ? 'warn' : ''}`;
+      `漂移 ${d >= 0 ? '+' : ''}${d.toFixed(1)}°${biasTxt}${driftOn ? ' · 补偿开' : ''}${gimbal ? ' · 万向锁' : ''}`;
+    driftToggleEl.className = `rate ${driftOn ? 'good' : bias !== null && Math.abs(bias) > 2 ? 'warn' : ''}`;
+
+    // 同一个读数发给大屏，进采集样本的 `meta.driftDeg`。
+    // 1Hz 就够：门限按速率判之后它是每秒变几度的慢变量，而读数的用途是「整段剔除」。
+    reportDrift();
   }, 1000);
 }
 
@@ -372,7 +421,12 @@ async function begin() {
   }
 
   link = new Link(room, 'peer', {
-    onState: setPill,
+    onState: (state) => {
+      setPill(state);
+      // 重连后立刻补报一次：大屏刚换段、本地 `driftDeg` 是 null，
+      // 而 `drift` 的累计量是连续的（重连不动 yawZero、也不清零），这份读数有效。
+      if (state === 'connected') reportDrift();
+    },
     onImu: () => {},
     onCtrl: (msg: CtrlMsg) => {
       if (msg.t === 'recal') {
@@ -380,17 +434,23 @@ async function begin() {
         // 补偿开启时，R 只清观测到的漂移量。重锁 yawZero 会把「当前朝向」重新
         // 定义成正前方，真机确认这只在反手位回得正、正手位会锁错方向。
         if (driftOn) {
-          // 同样要先固化再清观测：直接 reset 会让拍子瞬间歪回累积的漂移量
+          // 先固化再清观测：直接 reset 会让拍子瞬间歪回累积的漂移量
           if (yawZero !== null) yawZero += drift.radians;
-          drift.reset();
         } else {
           yawZero = null;
         }
+        // **两条分支都要清观测。** 补偿关时不清的话 `driftDeg` 会跨过这次重标定
+        // 一直累加，记进样本就不再是「相对当前基准」的量；而且之后中途打开补偿，
+        // 会把这段重标定之前的量再扣一遍——那部分已经被重锁抵消了。
+        // 零偏保留（`resetAngle`）：重标定改的是「正前方指哪」，不改陀螺的零偏。
+        drift.resetAngle();
         // 清掉连续性状态，下一帧直接以当前绝对姿态为新的可信基准
         poseGate.reset();
         extrapBase = null;
         trackerAtBase = null;
         link?.sendCtrl({ t: 'recal-ack', at: performance.now() });
+        // 归零之后立刻把 0 报上去，别等下一个 1Hz tick（大屏刚换段，那时本地是 null）
+        reportDrift();
       } else if (msg.t === 'ping') {
         // 必须回 pong，否则大屏那边的时钟同步永远收敛不了：
         // 单向延迟算不出来，所有延迟指标都是「—」，而 pkt.tSend 也没法换算到本地时钟，
